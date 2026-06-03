@@ -1,0 +1,4 @@
+codex-quota-viewer
+.env
+.DS_Store
+coverage.out

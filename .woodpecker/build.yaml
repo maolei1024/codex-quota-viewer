@@ -1,0 +1,41 @@
+# Multi-arch Docker build and push to private Nexus registry.
+matrix:
+  ARCH:
+    - amd64
+    - arm64
+
+labels:
+  arch: ${ARCH}
+
+when:
+  - event: push
+    branch: master
+
+steps:
+  - name: test
+    image: golang:1.23-alpine
+    commands:
+      - go test ./...
+
+  - name: build-push
+    image: woodpeckerci/plugin-docker-buildx
+    settings:
+      repo: docker.nexus.ixuni.win/codex-quota-viewer
+      registry: docker.nexus.ixuni.win
+      tags: "latest-${ARCH},v${CI_PIPELINE_NUMBER}-${ARCH}"
+      platforms: "linux/${ARCH}"
+      username:
+        from_secret: nexus_username
+      password:
+        from_secret: nexus_password
+
+  - name: notify-failure
+    image: docker.nexus.ixuni.win/woodpecker-mlntfy:v4
+    when:
+      - status: [failure]
+    settings:
+      url: https://mlntfy.project.k3s.ixuni.win
+      topic: mlNtfy
+      status: failure
+      priority: high
+      tags: "ci,failure,build,${ARCH}"

@@ -1,0 +1,6 @@
+.git
+.woodpecker
+codex-quota-viewer
+.env
+coverage.out
+tmp
