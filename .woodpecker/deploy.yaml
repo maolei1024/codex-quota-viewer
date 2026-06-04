@@ -1,0 +1,40 @@
+# Manifest merge + notification. No runtime deployment is performed here.
+depends_on:
+  - build
+
+when:
+  - event: push
+    branch: master
+
+steps:
+  - name: manifest
+    image: mplatform/manifest-tool:alpine
+    commands:
+      - 'manifest-tool --username=$${NEXUS_USERNAME} --password=$${NEXUS_PASSWORD} push from-args --platforms linux/amd64,linux/arm64 --template docker.nexus.ixuni.win/codex-quota-viewer:latest-ARCH --target docker.nexus.ixuni.win/codex-quota-viewer:latest'
+      - 'manifest-tool --username=$${NEXUS_USERNAME} --password=$${NEXUS_PASSWORD} push from-args --platforms linux/amd64,linux/arm64 --template docker.nexus.ixuni.win/codex-quota-viewer:v${CI_PIPELINE_NUMBER}-ARCH --target docker.nexus.ixuni.win/codex-quota-viewer:v${CI_PIPELINE_NUMBER}'
+    environment:
+      NEXUS_USERNAME:
+        from_secret: nexus_username
+      NEXUS_PASSWORD:
+        from_secret: nexus_password
+
+  - name: notify-success
+    image: docker.nexus.ixuni.win/woodpecker-mlntfy:v4
+    when:
+      - status: [success]
+    settings:
+      url: https://mlntfy.project.k3s.ixuni.win
+      topic: mlNtfy
+      status: success
+      tags: ci,success,deploy
+
+  - name: notify-failure
+    image: docker.nexus.ixuni.win/woodpecker-mlntfy:v4
+    when:
+      - status: [failure]
+    settings:
+      url: https://mlntfy.project.k3s.ixuni.win
+      topic: mlNtfy
+      status: failure
+      priority: high
+      tags: ci,failure,deploy

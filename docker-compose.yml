@@ -1,6 +1,6 @@
 services:
   codex-quota-viewer:
-    image: docker.nexus.ixuni.win/codex-quota-viewer:latest-amd64
+    image: docker.nexus.ixuni.win/codex-quota-viewer:latest
     container_name: codex-quota-viewer
     user: "${UID:-1000}:${GID:-1000}"
     restart: unless-stopped
