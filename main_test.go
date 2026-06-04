@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
+	"html/template"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -122,5 +125,88 @@ func TestLoadUsageFromSQLite(t *testing.T) {
 	}
 	if len(usage.Models) != 1 || usage.Models[0].ModelID != "gpt-5-codex" {
 		t.Fatalf("models = %+v", usage.Models)
+	}
+}
+
+func TestRefreshIntervalConfig(t *testing.T) {
+	t.Setenv("LISTEN_ADDR", ":9090")
+	t.Setenv("DATA_DIR", "/tmp/codex-data")
+	t.Setenv("REFRESH_INTERVAL_SECONDS", "120")
+
+	cfg := loadConfig()
+	if cfg.Refresh != 2*time.Minute {
+		t.Fatalf("refresh = %s, want 2m", cfg.Refresh)
+	}
+	if cfg.ListenAddr != ":9090" || cfg.DataDir != "/tmp/codex-data" {
+		t.Fatalf("unexpected config: %+v", cfg)
+	}
+}
+
+func TestUsageDisplayHelpers(t *testing.T) {
+	totals := usageTotals{
+		RequestCount:        10,
+		SuccessCount:        8,
+		FailureCount:        1,
+		ClientCanceledCount: 1,
+		TotalLatencyMs:      12_500,
+		EstimatedCostUSD:    0.0123,
+	}
+	if got := successRateLabel(totals); got != "80.0%" {
+		t.Fatalf("successRateLabel = %q", got)
+	}
+	if got := failureRateLabel(totals); got != "20.0%" {
+		t.Fatalf("failureRateLabel = %q", got)
+	}
+	if got := failurePercent(totals); got != 20 {
+		t.Fatalf("failurePercent = %d", got)
+	}
+	if got := avgLatencyLabel(totals); got != "1.2s" {
+		t.Fatalf("avgLatencyLabel = %q", got)
+	}
+	if got := barWidth(5, 10); got != 50 {
+		t.Fatalf("barWidth = %d", got)
+	}
+	if got := durationLabel(5 * time.Minute); got != "5m" {
+		t.Fatalf("durationLabel = %q", got)
+	}
+}
+
+func TestDashboardTemplateRendersNewLayout(t *testing.T) {
+	tmpl := template.Must(template.New("dashboard").Funcs(dashboardFuncs()).Parse(dashboardHTML))
+	summary := summaryView{
+		GeneratedLabel:   "2026-06-04 13:30:00",
+		RefreshSeconds:   300,
+		RefreshLabel:     "5m",
+		MaxModelRequests: 20,
+		Accounts: []accountView{{
+			Email:             "m***@**.com",
+			AuthMode:          "oauth",
+			PlanType:          "Plus",
+			Hourly:            quotaWindow{Present: true, Remaining: 98, ResetLabel: "2026-06-04 18:00:00", Class: "ok"},
+			Weekly:            quotaWindow{Present: true, Remaining: 94, ResetLabel: "2026-06-08 18:00:00", Class: "ok"},
+			UsageUpdatedLabel: "2026-06-04 13:29:00",
+		}},
+		LocalAccessUsage: usageView{
+			Available:    true,
+			Source:       "stats-json",
+			UpdatedLabel: "2026-06-04 13:29:00",
+			Daily:        usageTotals{RequestCount: 10, SuccessCount: 9, FailureCount: 1, TotalLatencyMs: 5000},
+			Weekly:       usageTotals{RequestCount: 20, SuccessCount: 18, FailureCount: 2, TotalLatencyMs: 12_000},
+			Monthly:      usageTotals{RequestCount: 20, SuccessCount: 18, FailureCount: 2, TotalLatencyMs: 12_000, EstimatedCostUSD: 0.02},
+			Models:       []modelUsage{{ModelID: "gpt-5-codex", Usage: usageTotals{RequestCount: 20, EstimatedCostUSD: 0.02}}},
+		},
+	}
+	var out bytes.Buffer
+	if err := tmpl.Execute(&out, summary); err != nil {
+		t.Fatal(err)
+	}
+	html := out.String()
+	for _, want := range []string{"data-refresh-seconds=\"300\"", "模型请求排行", "gpt-5-codex", "生成 2026-06-04 13:30:00"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("rendered html missing %q", want)
+		}
+	}
+	if strings.Contains(html, "账号数") || strings.Contains(html, "最低 5h 额度") {
+		t.Fatalf("rendered html still contains removed summary metrics")
 	}
 }

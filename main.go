@@ -20,15 +20,17 @@ import (
 )
 
 const (
-	defaultListenAddr = ":8080"
-	defaultDataDir    = "/data"
-	defaultStaleAfter = 30 * time.Minute
+	defaultListenAddr      = ":8080"
+	defaultDataDir         = "/data"
+	defaultStaleAfter      = 30 * time.Minute
+	defaultRefreshInterval = 5 * time.Minute
 )
 
 type config struct {
 	ListenAddr string
 	DataDir    string
 	StaleAfter time.Duration
+	Refresh    time.Duration
 }
 
 type rawAccount struct {
@@ -80,15 +82,24 @@ type quotaWindow struct {
 }
 
 type usageTotals struct {
-	RequestCount     int64   `json:"requestCount"`
-	SuccessCount     int64   `json:"successCount"`
-	FailureCount     int64   `json:"failureCount"`
-	InputTokens      int64   `json:"inputTokens"`
-	OutputTokens     int64   `json:"outputTokens"`
-	TotalTokens      int64   `json:"totalTokens"`
-	CachedTokens     int64   `json:"cachedTokens"`
-	ReasoningTokens  int64   `json:"reasoningTokens"`
-	EstimatedCostUSD float64 `json:"estimatedCostUsd"`
+	RequestCount                          int64   `json:"requestCount"`
+	SuccessCount                          int64   `json:"successCount"`
+	FailureCount                          int64   `json:"failureCount"`
+	ClientCanceledCount                   int64   `json:"clientCanceledCount"`
+	UpstreamResponseFailedCount           int64   `json:"upstreamResponseFailedCount"`
+	StreamIncompleteCount                 int64   `json:"streamIncompleteCount"`
+	TotalLatencyMs                        int64   `json:"totalLatencyMs"`
+	TextRequestCount                      int64   `json:"textRequestCount"`
+	ImageRequestCount                     int64   `json:"imageRequestCount"`
+	ImageGenerationRequestCount           int64   `json:"imageGenerationRequestCount"`
+	ImageEditRequestCount                 int64   `json:"imageEditRequestCount"`
+	ImageGenerationCapabilityFailureCount int64   `json:"imageGenerationCapabilityFailureCount"`
+	InputTokens                           int64   `json:"inputTokens"`
+	OutputTokens                          int64   `json:"outputTokens"`
+	TotalTokens                           int64   `json:"totalTokens"`
+	CachedTokens                          int64   `json:"cachedTokens"`
+	ReasoningTokens                       int64   `json:"reasoningTokens"`
+	EstimatedCostUSD                      float64 `json:"estimatedCostUsd"`
 }
 
 type modelUsage struct {
@@ -97,13 +108,17 @@ type modelUsage struct {
 }
 
 type usageView struct {
-	Available bool         `json:"available"`
-	Source    string       `json:"source"`
-	Daily     usageTotals  `json:"daily"`
-	Weekly    usageTotals  `json:"weekly"`
-	Monthly   usageTotals  `json:"monthly"`
-	Models    []modelUsage `json:"models"`
-	Error     string       `json:"error,omitempty"`
+	Available    bool         `json:"available"`
+	Source       string       `json:"source"`
+	Since        int64        `json:"since,omitempty"`
+	SinceLabel   string       `json:"sinceLabel,omitempty"`
+	UpdatedAt    int64        `json:"updatedAt,omitempty"`
+	UpdatedLabel string       `json:"updatedLabel,omitempty"`
+	Daily        usageTotals  `json:"daily"`
+	Weekly       usageTotals  `json:"weekly"`
+	Monthly      usageTotals  `json:"monthly"`
+	Models       []modelUsage `json:"models"`
+	Error        string       `json:"error,omitempty"`
 }
 
 type summaryView struct {
@@ -114,14 +129,19 @@ type summaryView struct {
 	ErrorCount       int           `json:"errorCount"`
 	LowestHourly     *int          `json:"lowestHourly,omitempty"`
 	LowestWeekly     *int          `json:"lowestWeekly,omitempty"`
+	RefreshSeconds   int           `json:"refreshSeconds"`
+	RefreshLabel     string        `json:"refreshLabel"`
+	MaxModelRequests int64         `json:"maxModelRequests"`
 	Accounts         []accountView `json:"accounts"`
 	LocalAccessUsage usageView     `json:"localAccessUsage"`
 }
 
 type rawStatsFile struct {
-	Daily   rawStatsWindow `json:"daily"`
-	Weekly  rawStatsWindow `json:"weekly"`
-	Monthly rawStatsWindow `json:"monthly"`
+	Since     int64          `json:"since"`
+	UpdatedAt int64          `json:"updatedAt"`
+	Daily     rawStatsWindow `json:"daily"`
+	Weekly    rawStatsWindow `json:"weekly"`
+	Monthly   rawStatsWindow `json:"monthly"`
 }
 
 type rawStatsWindow struct {
@@ -136,12 +156,7 @@ type rawModelStats struct {
 
 func main() {
 	cfg := loadConfig()
-	app := &server{cfg: cfg, tmpl: template.Must(template.New("dashboard").Funcs(template.FuncMap{
-		"percent":     percentLabel,
-		"tokens":      compactInt,
-		"cost":        costLabel,
-		"statusClass": statusClass,
-	}).Parse(dashboardHTML))}
+	app := &server{cfg: cfg, tmpl: template.Must(template.New("dashboard").Funcs(dashboardFuncs()).Parse(dashboardHTML))}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", app.handleDashboard)
@@ -153,6 +168,20 @@ func main() {
 	log.Printf("codex-quota-viewer listening on %s, data dir %s", cfg.ListenAddr, cfg.DataDir)
 	if err := http.ListenAndServe(cfg.ListenAddr, securityHeaders(mux)); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func dashboardFuncs() template.FuncMap {
+	return template.FuncMap{
+		"percent":        percentLabel,
+		"tokens":         compactInt,
+		"cost":           costLabel,
+		"statusClass":    statusClass,
+		"successRate":    successRateLabel,
+		"failureRate":    failureRateLabel,
+		"avgLatency":     avgLatencyLabel,
+		"barWidth":       barWidth,
+		"failurePercent": failurePercent,
 	}
 }
 
@@ -176,14 +205,20 @@ func loadConfig() config {
 			staleAfter = time.Duration(minutes) * time.Minute
 		}
 	}
-	return config{ListenAddr: listenAddr, DataDir: filepath.Clean(dataDir), StaleAfter: staleAfter}
+	refresh := defaultRefreshInterval
+	if raw := strings.TrimSpace(os.Getenv("REFRESH_INTERVAL_SECONDS")); raw != "" {
+		if seconds, err := strconv.Atoi(raw); err == nil && seconds >= 0 {
+			refresh = time.Duration(seconds) * time.Second
+		}
+	}
+	return config{ListenAddr: listenAddr, DataDir: filepath.Clean(dataDir), StaleAfter: staleAfter, Refresh: refresh}
 }
 
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline' 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline' 'self'; script-src 'unsafe-inline' 'self'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -233,12 +268,15 @@ func (s *server) buildSummary() summaryView {
 			Error:             err.Error(),
 		}}
 	}
+	usage := loadUsage(s.cfg.DataDir)
 	summary := summaryView{
 		GeneratedAt:      now.Unix(),
 		GeneratedLabel:   formatTime(now.Unix()),
 		AccountCount:     len(accounts),
+		RefreshSeconds:   int(s.cfg.Refresh.Seconds()),
+		RefreshLabel:     durationLabel(s.cfg.Refresh),
 		Accounts:         accounts,
-		LocalAccessUsage: loadUsage(s.cfg.DataDir),
+		LocalAccessUsage: usage,
 	}
 	for _, account := range accounts {
 		if account.Stale {
@@ -258,6 +296,11 @@ func (s *server) buildSummary() summaryView {
 			if summary.LowestWeekly == nil || value < *summary.LowestWeekly {
 				summary.LowestWeekly = &value
 			}
+		}
+	}
+	for _, model := range usage.Models {
+		if model.Usage.RequestCount > summary.MaxModelRequests {
+			summary.MaxModelRequests = model.Usage.RequestCount
 		}
 	}
 	return summary
@@ -383,12 +426,16 @@ func loadUsageFromStatsFile(path string) (usageView, bool) {
 	}
 	sortModels(models)
 	return usageView{
-		Available: true,
-		Source:    "stats-json",
-		Daily:     stats.Daily.Totals,
-		Weekly:    stats.Weekly.Totals,
-		Monthly:   stats.Monthly.Totals,
-		Models:    models,
+		Available:    true,
+		Source:       "stats-json",
+		Since:        stats.Since,
+		SinceLabel:   formatOptionalUnix(stats.Since),
+		UpdatedAt:    stats.UpdatedAt,
+		UpdatedLabel: formatOptionalUnix(stats.UpdatedAt),
+		Daily:        stats.Daily.Totals,
+		Weekly:       stats.Weekly.Totals,
+		Monthly:      stats.Monthly.Totals,
+		Models:       models,
 	}, true
 }
 
@@ -408,12 +455,14 @@ func loadUsageFromSQLite(path string) usageView {
 	monthly := queryUsageTotals(db, now.Add(-30*24*time.Hour).Unix())
 	models := queryModelUsage(db, now.Add(-30*24*time.Hour).Unix())
 	return usageView{
-		Available: true,
-		Source:    "sqlite",
-		Daily:     daily,
-		Weekly:    weekly,
-		Monthly:   monthly,
-		Models:    models,
+		Available:    true,
+		Source:       "sqlite",
+		UpdatedAt:    now.Unix(),
+		UpdatedLabel: formatTime(now.Unix()),
+		Daily:        daily,
+		Weekly:       weekly,
+		Monthly:      monthly,
+		Models:       models,
 	}
 }
 
@@ -613,11 +662,72 @@ func costLabel(value float64) string {
 	return fmt.Sprintf("$%.2f", value)
 }
 
+func successRateLabel(totals usageTotals) string {
+	if totals.RequestCount <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.1f%%", float64(totals.SuccessCount)*100/float64(totals.RequestCount))
+}
+
+func failureRateLabel(totals usageTotals) string {
+	if totals.RequestCount <= 0 {
+		return "-"
+	}
+	failed := totals.FailureCount + totals.ClientCanceledCount + totals.UpstreamResponseFailedCount + totals.StreamIncompleteCount
+	return fmt.Sprintf("%.1f%%", float64(failed)*100/float64(totals.RequestCount))
+}
+
+func failurePercent(totals usageTotals) int {
+	if totals.RequestCount <= 0 {
+		return 0
+	}
+	failed := totals.FailureCount + totals.ClientCanceledCount + totals.UpstreamResponseFailedCount + totals.StreamIncompleteCount
+	return clamp(int(math.Round(float64(failed)*100/float64(totals.RequestCount))), 0, 100)
+}
+
+func avgLatencyLabel(totals usageTotals) string {
+	if totals.RequestCount <= 0 || totals.TotalLatencyMs <= 0 {
+		return "-"
+	}
+	avg := float64(totals.TotalLatencyMs) / float64(totals.RequestCount)
+	if avg >= 1000 {
+		return fmt.Sprintf("%.1fs", avg/1000)
+	}
+	return fmt.Sprintf("%.0fms", avg)
+}
+
+func barWidth(value, max int64) int {
+	if value <= 0 || max <= 0 {
+		return 0
+	}
+	return clamp(int(math.Round(float64(value)*100/float64(max))), 2, 100)
+}
+
+func durationLabel(value time.Duration) string {
+	if value <= 0 {
+		return "关闭"
+	}
+	if value%time.Hour == 0 {
+		return fmt.Sprintf("%dh", int(value/time.Hour))
+	}
+	if value%time.Minute == 0 {
+		return fmt.Sprintf("%dm", int(value/time.Minute))
+	}
+	return fmt.Sprintf("%ds", int(value/time.Second))
+}
+
 func formatOptionalTime(ts *int64) string {
 	if ts == nil || *ts <= 0 {
 		return "-"
 	}
 	return formatTime(*ts)
+}
+
+func formatOptionalUnix(ts int64) string {
+	if ts <= 0 {
+		return "-"
+	}
+	return formatTime(ts)
 }
 
 func formatTime(ts int64) string {
@@ -631,14 +741,16 @@ var dashboardHTML = `<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Codex Quota Viewer</title>
   <style>
-    :root { color-scheme: light; --bg:#f6f7f9; --panel:#fff; --text:#17202a; --muted:#667085; --line:#d8dde6; --ok:#15803d; --warn:#b45309; --danger:#b91c1c; }
+    :root { color-scheme: light; --bg:#f5f6f8; --panel:#fff; --text:#17202a; --muted:#667085; --line:#d8dde6; --soft:#f0f3f7; --ok:#15803d; --ok-bg:#dcfce7; --warn:#b45309; --warn-bg:#fef3c7; --danger:#b91c1c; --danger-bg:#fee2e2; --accent:#2563eb; }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
-    header { padding: 24px 28px 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
+    header { padding: 22px 28px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
     h1 { margin: 0 0 8px; font-size: 24px; font-weight: 700; }
     .muted { color: var(--muted); }
     main { padding: 20px 28px 32px; max-width: 1280px; margin: 0 auto; }
-    .summary { display: grid; grid-template-columns: repeat(5, minmax(140px, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .status-line { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; color: var(--muted); font-size: 13px; }
+    .status-line span { display: inline-flex; align-items: center; gap: 6px; }
+    .dot { width: 7px; height: 7px; border-radius: 999px; background: var(--ok); }
     .metric, section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
     .metric { padding: 14px 16px; }
     .metric span { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
@@ -650,44 +762,62 @@ var dashboardHTML = `<!doctype html>
     th { font-size: 12px; color: var(--muted); font-weight: 600; background: #fbfcfd; }
     tr:last-child td { border-bottom: 0; }
     .pill { display: inline-flex; align-items: center; min-width: 56px; justify-content: center; padding: 3px 8px; border-radius: 999px; font-weight: 700; font-size: 12px; }
-    .ok { color: var(--ok); background: #dcfce7; }
-    .warn { color: var(--warn); background: #fef3c7; }
-    .danger { color: var(--danger); background: #fee2e2; }
+    .ok { color: var(--ok); background: var(--ok-bg); }
+    .warn { color: var(--warn); background: var(--warn-bg); }
+    .danger { color: var(--danger); background: var(--danger-bg); }
     .unknown { color: var(--muted); background: #eef2f7; }
-    .grid3 { display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 12px; padding: 16px; }
+    .bar-cell { min-width: 150px; }
+    .quota { display: grid; grid-template-columns: 44px minmax(88px, 1fr); gap: 8px; align-items: center; }
+    .track { height: 8px; overflow: hidden; border-radius: 999px; background: var(--soft); }
+    .fill { height: 100%; border-radius: inherit; background: var(--ok); }
+    .fill.warn { background: var(--warn); }
+    .fill.danger { background: var(--danger); }
+    .fill.unknown { background: #9aa4b2; }
+    .grid3 { display: grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap: 12px; padding: 16px; }
+    .usage-card { border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: #fff; }
+    .usage-card h3 { margin: 0 0 10px; font-size: 14px; }
+    .usage-card dl { display: grid; grid-template-columns: 1fr auto; gap: 7px 12px; margin: 0; font-size: 13px; }
+    .usage-card dt { color: var(--muted); }
+    .usage-card dd { margin: 0; font-weight: 700; }
+    .stack { display: flex; height: 8px; overflow: hidden; border-radius: 999px; background: var(--soft); margin: 12px 0 2px; }
+    .stack .success { background: var(--ok); }
+    .stack .failure { background: var(--danger); }
+    .chart { padding: 12px 16px 16px; }
+    .chart-row { display: grid; grid-template-columns: minmax(140px, 240px) minmax(120px, 1fr) 84px 84px; gap: 12px; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+    .chart-row:last-child { border-bottom: 0; }
+    .chart-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .chart-bar { height: 10px; overflow: hidden; border-radius: 999px; background: var(--soft); }
+    .chart-bar span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
     .empty { padding: 18px 16px; color: var(--muted); }
     .error { color: var(--danger); max-width: 360px; overflow-wrap: anywhere; }
-    @media (max-width: 860px) { main, header { padding-left: 14px; padding-right: 14px; } .summary, .grid3 { grid-template-columns: 1fr; } section { overflow-x: auto; } th, td { white-space: nowrap; } }
+    @media (max-width: 860px) { main, header { padding-left: 14px; padding-right: 14px; } .grid3 { grid-template-columns: 1fr; } section { overflow-x: auto; } th, td { white-space: nowrap; } .chart-row { grid-template-columns: 160px 180px 72px 72px; min-width: 520px; } }
   </style>
 </head>
-<body>
+<body data-refresh-seconds="{{.RefreshSeconds}}">
   <header>
     <h1>Codex Quota Viewer</h1>
-    <div class="muted">生成时间 {{.GeneratedLabel}}，数据来自只读 Cockpit Tools 本地缓存。</div>
+    <div class="status-line">
+      <span><span class="dot"></span>生成 {{.GeneratedLabel}}</span>
+      <span>用量更新 {{if .LocalAccessUsage.UpdatedLabel}}{{.LocalAccessUsage.UpdatedLabel}}{{else}}-{{end}}</span>
+      <span>数据源 {{.LocalAccessUsage.Source}}</span>
+      <span>自动刷新 <strong id="refresh-label">{{.RefreshLabel}}</strong><span id="refresh-countdown"></span></span>
+    </div>
   </header>
   <main>
-    <div class="summary">
-      <div class="metric"><span>账号数</span><strong>{{.AccountCount}}</strong></div>
-      <div class="metric"><span>最低 5h 额度</span><strong>{{percent .LowestHourly}}</strong></div>
-      <div class="metric"><span>最低周额度</span><strong>{{percent .LowestWeekly}}</strong></div>
-      <div class="metric"><span>过期缓存</span><strong>{{.StaleCount}}</strong></div>
-      <div class="metric"><span>错误账号</span><strong class="{{statusClass .}}">{{.ErrorCount}}</strong></div>
-    </div>
-
     <section>
       <h2>Codex 账号额度</h2>
       {{if .Accounts}}
       <table>
-        <thead><tr><th>账号</th><th>Plan</th><th>认证</th><th>5h 剩余</th><th>5h 重置</th><th>周剩余</th><th>周重置</th><th>上次刷新</th><th>状态</th></tr></thead>
+        <thead><tr><th>账号</th><th>Plan</th><th>认证</th><th>5h 剩余</th><th>5h 重置</th><th>周剩余</th><th>周重置</th><th>缓存更新</th><th>状态</th></tr></thead>
         <tbody>
         {{range .Accounts}}
           <tr>
             <td>{{.Email}}</td>
             <td>{{.PlanType}}</td>
             <td>{{.AuthMode}}</td>
-            <td>{{if .Hourly.Present}}<span class="pill {{.Hourly.Class}}">{{.Hourly.Remaining}}%</span>{{else}}-{{end}}</td>
+            <td class="bar-cell">{{if .Hourly.Present}}<div class="quota"><strong>{{.Hourly.Remaining}}%</strong><div class="track"><div class="fill {{.Hourly.Class}}" style="width: {{.Hourly.Remaining}}%"></div></div></div>{{else}}-{{end}}</td>
             <td>{{.Hourly.ResetLabel}}</td>
-            <td>{{if .Weekly.Present}}<span class="pill {{.Weekly.Class}}">{{.Weekly.Remaining}}%</span>{{else}}-{{end}}</td>
+            <td class="bar-cell">{{if .Weekly.Present}}<div class="quota"><strong>{{.Weekly.Remaining}}%</strong><div class="track"><div class="fill {{.Weekly.Class}}" style="width: {{.Weekly.Remaining}}%"></div></div></div>{{else}}-{{end}}</td>
             <td>{{.Weekly.ResetLabel}}</td>
             <td>{{.UsageUpdatedLabel}}</td>
             <td>{{if .Error}}<span class="error">{{.Error}}</span>{{else if .Stale}}<span class="pill warn">stale</span>{{else}}<span class="pill ok">ok</span>{{end}}</td>
@@ -702,31 +832,75 @@ var dashboardHTML = `<!doctype html>
       <h2>本地 API 服务用量</h2>
       {{if .LocalAccessUsage.Available}}
       <div class="grid3">
-        <div class="metric"><span>24h 请求 / tokens</span><strong>{{.LocalAccessUsage.Daily.RequestCount}} / {{tokens .LocalAccessUsage.Daily.TotalTokens}}</strong></div>
-        <div class="metric"><span>7d 请求 / tokens</span><strong>{{.LocalAccessUsage.Weekly.RequestCount}} / {{tokens .LocalAccessUsage.Weekly.TotalTokens}}</strong></div>
-        <div class="metric"><span>30d 请求 / 成本</span><strong>{{.LocalAccessUsage.Monthly.RequestCount}} / {{cost .LocalAccessUsage.Monthly.EstimatedCostUSD}}</strong></div>
+        <div class="usage-card">
+          <h3>24h</h3>
+          <dl><dt>请求</dt><dd>{{.LocalAccessUsage.Daily.RequestCount}}</dd><dt>成功率</dt><dd>{{successRate .LocalAccessUsage.Daily}}</dd><dt>失败率</dt><dd>{{failureRate .LocalAccessUsage.Daily}}</dd><dt>平均延迟</dt><dd>{{avgLatency .LocalAccessUsage.Daily}}</dd><dt>成本</dt><dd>{{cost .LocalAccessUsage.Daily.EstimatedCostUSD}}</dd></dl>
+          <div class="stack"><span class="success" style="width: {{barWidth .LocalAccessUsage.Daily.SuccessCount .LocalAccessUsage.Daily.RequestCount}}%"></span><span class="failure" style="width: {{failurePercent .LocalAccessUsage.Daily}}%"></span></div>
+        </div>
+        <div class="usage-card">
+          <h3>7d</h3>
+          <dl><dt>请求</dt><dd>{{.LocalAccessUsage.Weekly.RequestCount}}</dd><dt>成功率</dt><dd>{{successRate .LocalAccessUsage.Weekly}}</dd><dt>失败率</dt><dd>{{failureRate .LocalAccessUsage.Weekly}}</dd><dt>平均延迟</dt><dd>{{avgLatency .LocalAccessUsage.Weekly}}</dd><dt>成本</dt><dd>{{cost .LocalAccessUsage.Weekly.EstimatedCostUSD}}</dd></dl>
+          <div class="stack"><span class="success" style="width: {{barWidth .LocalAccessUsage.Weekly.SuccessCount .LocalAccessUsage.Weekly.RequestCount}}%"></span><span class="failure" style="width: {{failurePercent .LocalAccessUsage.Weekly}}%"></span></div>
+        </div>
+        <div class="usage-card">
+          <h3>30d</h3>
+          <dl><dt>请求</dt><dd>{{.LocalAccessUsage.Monthly.RequestCount}}</dd><dt>成功率</dt><dd>{{successRate .LocalAccessUsage.Monthly}}</dd><dt>失败率</dt><dd>{{failureRate .LocalAccessUsage.Monthly}}</dd><dt>平均延迟</dt><dd>{{avgLatency .LocalAccessUsage.Monthly}}</dd><dt>成本</dt><dd>{{cost .LocalAccessUsage.Monthly.EstimatedCostUSD}}</dd></dl>
+          <div class="stack"><span class="success" style="width: {{barWidth .LocalAccessUsage.Monthly.SuccessCount .LocalAccessUsage.Monthly.RequestCount}}%"></span><span class="failure" style="width: {{failurePercent .LocalAccessUsage.Monthly}}%"></span></div>
+        </div>
       </div>
-      {{if .LocalAccessUsage.Models}}
-      <table>
-        <thead><tr><th>模型</th><th>请求</th><th>成功</th><th>失败</th><th>输入 tokens</th><th>输出 tokens</th><th>总 tokens</th><th>估算成本</th></tr></thead>
-        <tbody>
-        {{range .LocalAccessUsage.Models}}
-          <tr>
-            <td>{{.ModelID}}</td>
-            <td>{{.Usage.RequestCount}}</td>
-            <td>{{.Usage.SuccessCount}}</td>
-            <td>{{.Usage.FailureCount}}</td>
-            <td>{{tokens .Usage.InputTokens}}</td>
-            <td>{{tokens .Usage.OutputTokens}}</td>
-            <td>{{tokens .Usage.TotalTokens}}</td>
-            <td>{{cost .Usage.EstimatedCostUSD}}</td>
-          </tr>
-        {{end}}
-        </tbody>
-      </table>
-      {{end}}
       {{else}}<div class="empty">未读取到本地 API 服务用量数据。{{.LocalAccessUsage.Error}}</div>{{end}}
     </section>
+
+    <section>
+      <h2>模型请求排行</h2>
+      {{if .LocalAccessUsage.Models}}
+      <div class="chart">
+        {{range .LocalAccessUsage.Models}}
+        <div class="chart-row">
+          <div class="chart-label">{{.ModelID}}</div>
+          <div class="chart-bar"><span style="width: {{barWidth .Usage.RequestCount $.MaxModelRequests}}%"></span></div>
+          <div>{{.Usage.RequestCount}} 次</div>
+          <div>{{cost .Usage.EstimatedCostUSD}}</div>
+        </div>
+        {{end}}
+      </div>
+      {{else}}<div class="empty">暂无模型维度用量。</div>{{end}}
+    </section>
+
+    {{if or .StaleCount .ErrorCount}}
+    <section>
+      <h2>异常</h2>
+      <table>
+        <thead><tr><th>类型</th><th>数量</th></tr></thead>
+        <tbody>
+          {{if .StaleCount}}<tr><td>额度缓存过期</td><td>{{.StaleCount}}</td></tr>{{end}}
+          {{if .ErrorCount}}<tr><td>账号额度错误</td><td>{{.ErrorCount}}</td></tr>{{end}}
+        </tbody>
+      </table>
+    </section>
+    {{end}}
   </main>
+  <script>
+    (function () {
+      var refreshSeconds = Number(document.body.dataset.refreshSeconds || "0");
+      if (!Number.isFinite(refreshSeconds) || refreshSeconds <= 0) return;
+      var countdown = document.getElementById("refresh-countdown");
+      var nextRefreshAt = Date.now() + refreshSeconds * 1000;
+      function renderCountdown() {
+        var remaining = Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000));
+        var minutes = Math.floor(remaining / 60);
+        var seconds = String(remaining % 60).padStart(2, "0");
+        if (countdown) countdown.textContent = " · " + minutes + ":" + seconds;
+        if (remaining <= 0) window.location.reload();
+      }
+      setInterval(renderCountdown, 1000);
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "visible" && Date.now() >= nextRefreshAt) {
+          window.location.reload();
+        }
+      });
+      renderCountdown();
+    })();
+  </script>
 </body>
 </html>`
