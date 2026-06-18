@@ -33,9 +33,10 @@ Cockpit Tools is not running, this viewer shows the last cached quota.
 ## Weekly Reset Notifications
 
 The viewer can send a webhook when an account's weekly quota reset time is
-reached, or when the cached weekly reset time jumps forward before the previous
-reset time was reached. The second case catches early quota resets caused by
-OpenAI incidents or temporary user rewards.
+reached, or when the cached weekly reset time jumps forward by at least five
+minutes before the previous reset time was reached. The second case catches
+early quota resets caused by OpenAI incidents or temporary user rewards while
+ignoring small timestamp drift in cached quota data.
 
 Notifications are deduplicated per account and reset timestamp. The state is
 stored in `WEEKLY_RESET_NOTIFY_STATE_DIR` so restarts do not resend the same

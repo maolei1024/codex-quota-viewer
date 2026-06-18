@@ -29,6 +29,7 @@ const (
 	defaultRefreshInterval = 5 * time.Minute
 	defaultNotifyStateDir  = "/state"
 	defaultNotifyTimeout   = 10 * time.Second
+	minWeeklyResetJump     = 5 * time.Minute
 )
 
 type config struct {
@@ -529,7 +530,8 @@ func checkWeeklyResetNotifications(cfg config, now time.Time, client *http.Clien
 		if observedResetAt <= 0 {
 			observedResetAt = currentResetAt
 		}
-		rolledForward := accountState.ObservedResetAt > 0 && currentResetAt > accountState.ObservedResetAt
+		resetJump := time.Duration(currentResetAt-accountState.ObservedResetAt) * time.Second
+		rolledForward := accountState.ObservedResetAt > 0 && resetJump >= minWeeklyResetJump
 		reachedObservedReset := observedResetAt <= nowUnix
 		needsNotification := accountState.NotifiedResetAt != observedResetAt && (reachedObservedReset || rolledForward)
 

@@ -353,6 +353,62 @@ func TestWeeklyResetNotifierSendsWebhookWhenObservedResetPasses(t *testing.T) {
 	}
 }
 
+func TestWeeklyResetNotifierSendsWebhookWhenFutureResetJumpsForward(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := t.TempDir()
+	now := time.Unix(1_780_000_000, 0)
+	observedReset := now.Add(time.Hour).Unix()
+	nextReset := now.Add(7 * 24 * time.Hour).Unix()
+	writeTestAccount(t, dir, "account-a", "alice@example.com", 100, nextReset)
+	if err := saveWeeklyResetReminderState(filepath.Join(stateDir, weeklyResetReminderStateFile), weeklyResetReminderState{
+		Accounts: map[string]weeklyResetAccountState{
+			"account-a": {ObservedResetAt: observedReset},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotPayload map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+	}))
+	defer server.Close()
+
+	cfg := config{
+		DataDir:                   dir,
+		StaleAfter:                30 * time.Minute,
+		WeeklyResetNotifyURL:      server.URL + "/api/notifications/simple/send/mlNtfy",
+		WeeklyResetNotifyStateDir: stateDir,
+		WeeklyResetNotifyTimeout:  time.Second,
+	}
+	if err := checkWeeklyResetNotifications(cfg, now, server.Client()); err != nil {
+		t.Fatal(err)
+	}
+	if gotPayload["title"] != "Codex 周额度已重置" {
+		t.Fatalf("title = %q", gotPayload["title"])
+	}
+	for _, want := range []string{"a***@**.com", "100%", formatTime(observedReset), formatTime(nextReset)} {
+		if !strings.Contains(gotPayload["message"], want) {
+			t.Fatalf("message missing %q: %q", want, gotPayload["message"])
+		}
+	}
+
+	state, err := loadWeeklyResetReminderState(filepath.Join(stateDir, weeklyResetReminderStateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountState := state.Accounts["account-a"]
+	if accountState.NotifiedResetAt != observedReset {
+		t.Fatalf("notified reset = %d, want %d", accountState.NotifiedResetAt, observedReset)
+	}
+	if accountState.ObservedResetAt != nextReset {
+		t.Fatalf("observed reset = %d, want %d", accountState.ObservedResetAt, nextReset)
+	}
+}
+
 func TestWeeklyResetNotifierDoesNotSendDuplicateWebhook(t *testing.T) {
 	dir := t.TempDir()
 	stateDir := t.TempDir()
@@ -386,6 +442,55 @@ func TestWeeklyResetNotifierDoesNotSendDuplicateWebhook(t *testing.T) {
 	}
 	if requests != 0 {
 		t.Fatalf("requests = %d, want 0", requests)
+	}
+}
+
+func TestWeeklyResetNotifierIgnoresTinyFutureResetDrift(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := t.TempDir()
+	now := time.Unix(1_780_000_000, 0)
+	observedReset := now.Add(7 * 24 * time.Hour).Unix()
+	currentReset := observedReset + 1
+	writeTestAccount(t, dir, "account-a", "alice@example.com", 97, currentReset)
+	if err := saveWeeklyResetReminderState(filepath.Join(stateDir, weeklyResetReminderStateFile), weeklyResetReminderState{
+		Accounts: map[string]weeklyResetAccountState{
+			"account-a": {ObservedResetAt: observedReset},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		t.Fatalf("unexpected webhook request")
+	}))
+	defer server.Close()
+
+	cfg := config{
+		DataDir:                   dir,
+		StaleAfter:                30 * time.Minute,
+		WeeklyResetNotifyURL:      server.URL + "/api/notifications/simple/send/mlNtfy",
+		WeeklyResetNotifyStateDir: stateDir,
+		WeeklyResetNotifyTimeout:  time.Second,
+	}
+	if err := checkWeeklyResetNotifications(cfg, now, server.Client()); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want 0", requests)
+	}
+
+	state, err := loadWeeklyResetReminderState(filepath.Join(stateDir, weeklyResetReminderStateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountState := state.Accounts["account-a"]
+	if accountState.NotifiedResetAt != 0 {
+		t.Fatalf("notified reset = %d, want 0", accountState.NotifiedResetAt)
+	}
+	if accountState.ObservedResetAt != currentReset {
+		t.Fatalf("observed reset = %d, want %d", accountState.ObservedResetAt, currentReset)
 	}
 }
 
