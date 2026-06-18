@@ -131,6 +131,18 @@ func TestLoadUsageFromSQLite(t *testing.T) {
 	}
 }
 
+func TestSQLiteReadOnlyDSNUsesImmutableMode(t *testing.T) {
+	dsn := sqliteReadOnlyDSN("/data/codex_local_access_logs.sqlite")
+	if !strings.HasPrefix(dsn, "file:") {
+		t.Fatalf("dsn = %q, want file URI", dsn)
+	}
+	for _, want := range []string{"mode=ro", "immutable=1"} {
+		if !strings.Contains(dsn, want) {
+			t.Fatalf("dsn = %q, missing %q", dsn, want)
+		}
+	}
+}
+
 func TestLoadUsageFromSQLiteIncludesModelAccountBreakdown(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "codex_local_access_logs.sqlite")

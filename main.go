@@ -11,6 +11,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -701,7 +702,7 @@ func loadUsageFromSQLite(path string) usageView {
 	if _, err := os.Stat(path); err != nil {
 		return usageView{Available: false, Source: "sqlite", Error: "no local access usage data"}
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	db, err := sql.Open("sqlite", sqliteReadOnlyDSN(path))
 	if err != nil {
 		return usageView{Available: false, Source: "sqlite", Error: "open sqlite failed"}
 	}
@@ -817,7 +818,7 @@ func attachModelAccountUsageFromSQLite(path string, since int64, models []modelU
 	if _, err := os.Stat(path); err != nil {
 		return models
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	db, err := sql.Open("sqlite", sqliteReadOnlyDSN(path))
 	if err != nil {
 		log.Printf("open sqlite for model account usage: %v", err)
 		return models
@@ -914,6 +915,15 @@ func requestLogsHaveColumns(db *sql.DB, columns ...string) bool {
 		}
 	}
 	return true
+}
+
+func sqliteReadOnlyDSN(path string) string {
+	uri := url.URL{Scheme: "file", Path: path}
+	query := uri.Query()
+	query.Set("mode", "ro")
+	query.Set("immutable", "1")
+	uri.RawQuery = query.Encode()
+	return uri.String()
 }
 
 func sortModels(models []modelUsage) {
