@@ -103,22 +103,29 @@ type usageTotals struct {
 }
 
 type modelUsage struct {
-	ModelID string      `json:"modelId"`
+	ModelID  string         `json:"modelId"`
+	Usage    usageTotals    `json:"usage"`
+	Accounts []accountUsage `json:"accounts,omitempty"`
+}
+
+type accountUsage struct {
+	Account string      `json:"account"`
 	Usage   usageTotals `json:"usage"`
 }
 
 type usageView struct {
-	Available    bool         `json:"available"`
-	Source       string       `json:"source"`
-	Since        int64        `json:"since,omitempty"`
-	SinceLabel   string       `json:"sinceLabel,omitempty"`
-	UpdatedAt    int64        `json:"updatedAt,omitempty"`
-	UpdatedLabel string       `json:"updatedLabel,omitempty"`
-	Daily        usageTotals  `json:"daily"`
-	Weekly       usageTotals  `json:"weekly"`
-	Monthly      usageTotals  `json:"monthly"`
-	Models       []modelUsage `json:"models"`
-	Error        string       `json:"error,omitempty"`
+	Available      bool         `json:"available"`
+	Source         string       `json:"source"`
+	Since          int64        `json:"since,omitempty"`
+	SinceLabel     string       `json:"sinceLabel,omitempty"`
+	UpdatedAt      int64        `json:"updatedAt,omitempty"`
+	UpdatedLabel   string       `json:"updatedLabel,omitempty"`
+	Daily          usageTotals  `json:"daily"`
+	Weekly         usageTotals  `json:"weekly"`
+	Monthly        usageTotals  `json:"monthly"`
+	Models         []modelUsage `json:"models"`
+	Error          string       `json:"error,omitempty"`
+	BreakdownSince int64        `json:"-"`
 }
 
 type summaryView struct {
@@ -145,8 +152,10 @@ type rawStatsFile struct {
 }
 
 type rawStatsWindow struct {
-	Totals usageTotals     `json:"totals"`
-	Models []rawModelStats `json:"models"`
+	Since     int64           `json:"since"`
+	UpdatedAt int64           `json:"updatedAt"`
+	Totals    usageTotals     `json:"totals"`
+	Models    []rawModelStats `json:"models"`
 }
 
 type rawModelStats struct {
@@ -406,6 +415,10 @@ func missingWindow() quotaWindow {
 func loadUsage(dataDir string) usageView {
 	statsPath := filepath.Join(dataDir, "codex_local_access_stats.json")
 	if usage, ok := loadUsageFromStatsFile(statsPath); ok {
+		if usage.Available {
+			sqlitePath := filepath.Join(dataDir, "codex_local_access_logs.sqlite")
+			usage.Models = attachModelAccountUsageFromSQLite(sqlitePath, usage.BreakdownSince, usage.Models)
+		}
 		return usage
 	}
 	return loadUsageFromSQLite(filepath.Join(dataDir, "codex_local_access_logs.sqlite"))
@@ -425,17 +438,22 @@ func loadUsageFromStatsFile(path string) (usageView, bool) {
 		models = append(models, modelUsage{ModelID: model.ModelID, Usage: model.Usage})
 	}
 	sortModels(models)
+	breakdownSince := stats.Monthly.Since
+	if breakdownSince <= 0 {
+		breakdownSince = time.Now().Add(-30 * 24 * time.Hour).Unix()
+	}
 	return usageView{
-		Available:    true,
-		Source:       "stats-json",
-		Since:        stats.Since,
-		SinceLabel:   formatOptionalUnix(stats.Since),
-		UpdatedAt:    stats.UpdatedAt,
-		UpdatedLabel: formatOptionalUnix(stats.UpdatedAt),
-		Daily:        stats.Daily.Totals,
-		Weekly:       stats.Weekly.Totals,
-		Monthly:      stats.Monthly.Totals,
-		Models:       models,
+		Available:      true,
+		Source:         "stats-json",
+		Since:          stats.Since,
+		SinceLabel:     formatOptionalUnix(stats.Since),
+		UpdatedAt:      stats.UpdatedAt,
+		UpdatedLabel:   formatOptionalUnix(stats.UpdatedAt),
+		Daily:          stats.Daily.Totals,
+		Weekly:         stats.Weekly.Totals,
+		Monthly:        stats.Monthly.Totals,
+		Models:         models,
+		BreakdownSince: breakdownSince,
 	}, true
 }
 
@@ -450,19 +468,23 @@ func loadUsageFromSQLite(path string) usageView {
 	defer db.Close()
 
 	now := time.Now()
-	daily := queryUsageTotals(db, now.Add(-24*time.Hour).Unix())
-	weekly := queryUsageTotals(db, now.Add(-7*24*time.Hour).Unix())
-	monthly := queryUsageTotals(db, now.Add(-30*24*time.Hour).Unix())
-	models := queryModelUsage(db, now.Add(-30*24*time.Hour).Unix())
+	dailySince := now.Add(-24 * time.Hour).Unix()
+	weeklySince := now.Add(-7 * 24 * time.Hour).Unix()
+	monthlySince := now.Add(-30 * 24 * time.Hour).Unix()
+	daily := queryUsageTotals(db, dailySince)
+	weekly := queryUsageTotals(db, weeklySince)
+	monthly := queryUsageTotals(db, monthlySince)
+	models := queryModelUsage(db, monthlySince)
 	return usageView{
-		Available:    true,
-		Source:       "sqlite",
-		UpdatedAt:    now.Unix(),
-		UpdatedLabel: formatTime(now.Unix()),
-		Daily:        daily,
-		Weekly:       weekly,
-		Monthly:      monthly,
-		Models:       models,
+		Available:      true,
+		Source:         "sqlite",
+		UpdatedAt:      now.Unix(),
+		UpdatedLabel:   formatTime(now.Unix()),
+		Daily:          daily,
+		Weekly:         weekly,
+		Monthly:        monthly,
+		Models:         models,
+		BreakdownSince: monthlySince,
 	}
 }
 
@@ -498,6 +520,7 @@ func queryUsageTotals(db *sql.DB, since int64) usageTotals {
 }
 
 func queryModelUsage(db *sql.DB, since int64) []modelUsage {
+	includeAccounts := requestLogsHaveColumns(db, "account_id", "email")
 	rows, err := db.Query(`
 		SELECT
 			COALESCE(NULLIF(model_id, ''), 'unknown') AS model_id,
@@ -539,9 +562,118 @@ func queryModelUsage(db *sql.DB, since int64) []modelUsage {
 			log.Printf("scan model usage: %v", err)
 			continue
 		}
+		if includeAccounts {
+			model.Accounts = queryModelAccountUsage(db, since, model.ModelID)
+		}
 		models = append(models, model)
 	}
 	return models
+}
+
+func attachModelAccountUsageFromSQLite(path string, since int64, models []modelUsage) []modelUsage {
+	if len(models) == 0 {
+		return models
+	}
+	if _, err := os.Stat(path); err != nil {
+		return models
+	}
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
+	if err != nil {
+		log.Printf("open sqlite for model account usage: %v", err)
+		return models
+	}
+	defer db.Close()
+	if !requestLogsHaveColumns(db, "account_id", "email") {
+		return models
+	}
+	if since <= 0 {
+		since = time.Now().Add(-30 * 24 * time.Hour).Unix()
+	}
+	for i := range models {
+		models[i].Accounts = queryModelAccountUsage(db, since, models[i].ModelID)
+	}
+	return models
+}
+
+func queryModelAccountUsage(db *sql.DB, since int64, modelID string) []accountUsage {
+	rows, err := db.Query(`
+		SELECT
+			COALESCE(MAX(NULLIF(email, '')), MAX(NULLIF(account_id, '')), 'unknown') AS account,
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(input_tokens), 0),
+			COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(total_tokens), 0),
+			COALESCE(SUM(cached_tokens), 0),
+			COALESCE(SUM(reasoning_tokens), 0),
+			COALESCE(SUM(estimated_cost_usd), 0)
+		FROM request_logs
+		WHERE timestamp >= ?
+			AND COALESCE(NULLIF(model_id, ''), 'unknown') = ?
+		GROUP BY COALESCE(NULLIF(account_id, ''), NULLIF(email, ''), 'unknown')
+		ORDER BY COUNT(*) DESC, COALESCE(SUM(estimated_cost_usd), 0) DESC
+		LIMIT 12`, since, modelID)
+	if err != nil {
+		log.Printf("query model account usage: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var accounts []accountUsage
+	for rows.Next() {
+		var account string
+		var usage usageTotals
+		if err := rows.Scan(
+			&account,
+			&usage.RequestCount,
+			&usage.SuccessCount,
+			&usage.FailureCount,
+			&usage.InputTokens,
+			&usage.OutputTokens,
+			&usage.TotalTokens,
+			&usage.CachedTokens,
+			&usage.ReasoningTokens,
+			&usage.EstimatedCostUSD,
+		); err != nil {
+			log.Printf("scan model account usage: %v", err)
+			continue
+		}
+		accounts = append(accounts, accountUsage{Account: maskUsageAccount(account), Usage: usage})
+	}
+	return accounts
+}
+
+func requestLogsHaveColumns(db *sql.DB, columns ...string) bool {
+	if len(columns) == 0 {
+		return true
+	}
+	rows, err := db.Query("PRAGMA table_info(request_logs)")
+	if err != nil {
+		log.Printf("inspect request_logs columns: %v", err)
+		return false
+	}
+	defer rows.Close()
+
+	available := make(map[string]bool)
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			log.Printf("scan request_logs column: %v", err)
+			return false
+		}
+		available[name] = true
+	}
+	for _, column := range columns {
+		if !available[column] {
+			return false
+		}
+	}
+	return true
 }
 
 func sortModels(models []modelUsage) {
@@ -592,6 +724,14 @@ func maskIdentity(value string) string {
 		}
 	}
 	return first + "***@**" + suffix
+}
+
+func maskUsageAccount(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "unknown" {
+		return "unknown"
+	}
+	return maskIdentity(value)
 }
 
 func dash(value string) string {
@@ -782,15 +922,19 @@ var dashboardHTML = `<!doctype html>
     .stack { display: flex; height: 8px; overflow: hidden; border-radius: 999px; background: var(--soft); margin: 12px 0 2px; }
     .stack .success { background: var(--ok); }
     .stack .failure { background: var(--danger); }
-    .chart { padding: 12px 16px 16px; }
-    .chart-row { display: grid; grid-template-columns: minmax(140px, 240px) minmax(120px, 1fr) 84px 84px; gap: 12px; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
-    .chart-row:last-child { border-bottom: 0; }
+    .chart { padding: 8px 16px 12px; }
+    .chart-item { border-bottom: 1px solid var(--line); padding: 8px 0; }
+    .chart-item:last-child { border-bottom: 0; }
+    .chart-row { display: grid; grid-template-columns: minmax(140px, 240px) minmax(120px, 1fr) 84px 84px; gap: 12px; align-items: center; font-size: 14px; }
     .chart-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .chart-bar { height: 10px; overflow: hidden; border-radius: 999px; background: var(--soft); }
     .chart-bar span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+    .account-breakdown { margin: 8px 0 0; padding-left: 18px; display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+    .account-row { display: grid; grid-template-columns: minmax(120px, 220px) 70px 78px; gap: 10px; align-items: center; }
+    .account-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
     .empty { padding: 18px 16px; color: var(--muted); }
     .error { color: var(--danger); max-width: 360px; overflow-wrap: anywhere; }
-    @media (max-width: 860px) { main, header { padding-left: 14px; padding-right: 14px; } .grid3 { grid-template-columns: 1fr; } section { overflow-x: auto; } th, td { white-space: nowrap; } .chart-row { grid-template-columns: 160px 180px 72px 72px; min-width: 520px; } }
+    @media (max-width: 860px) { main, header { padding-left: 14px; padding-right: 14px; } .grid3 { grid-template-columns: 1fr; } section { overflow-x: auto; } th, td { white-space: nowrap; } .chart-item { min-width: 520px; } .chart-row { grid-template-columns: 160px 180px 72px 72px; } }
   </style>
 </head>
 <body data-refresh-seconds="{{.RefreshSeconds}}">
@@ -856,11 +1000,24 @@ var dashboardHTML = `<!doctype html>
       {{if .LocalAccessUsage.Models}}
       <div class="chart">
         {{range .LocalAccessUsage.Models}}
-        <div class="chart-row">
-          <div class="chart-label">{{.ModelID}}</div>
-          <div class="chart-bar"><span style="width: {{barWidth .Usage.RequestCount $.MaxModelRequests}}%"></span></div>
-          <div>{{.Usage.RequestCount}} 次</div>
-          <div>{{cost .Usage.EstimatedCostUSD}}</div>
+        <div class="chart-item">
+          <div class="chart-row">
+            <div class="chart-label">{{.ModelID}}</div>
+            <div class="chart-bar"><span style="width: {{barWidth .Usage.RequestCount $.MaxModelRequests}}%"></span></div>
+            <div>{{.Usage.RequestCount}} 次</div>
+            <div>{{cost .Usage.EstimatedCostUSD}}</div>
+          </div>
+          {{if .Accounts}}
+          <div class="account-breakdown">
+            {{range .Accounts}}
+            <div class="account-row">
+              <span class="account-name">{{.Account}}</span>
+              <span>{{.Usage.RequestCount}} 次</span>
+              <span>{{cost .Usage.EstimatedCostUSD}}</span>
+            </div>
+            {{end}}
+          </div>
+          {{end}}
         </div>
         {{end}}
       </div>

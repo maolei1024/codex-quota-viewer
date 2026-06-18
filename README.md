@@ -14,6 +14,16 @@ Mount the Cockpit Tools data directory as `/data:ro`:
 - `/data/codex_local_access_stats.json`
 - `/data/codex_local_access_logs.sqlite`
 
+`codex_local_access_stats.json` contains precomputed aggregate windows such as
+totals, account totals, model totals, and API key totals. It does not retain the
+raw event list, so it cannot answer model-by-account breakdowns by itself.
+
+`codex_local_access_logs.sqlite` contains per-request local API service logs,
+including timestamp, account id/email, API key id/label, model id, success
+status, latency, token counts, and estimated cost. When this file is mounted,
+the model request ranking includes a masked per-account breakdown for each
+model row.
+
 Codex quota data is only as fresh as Cockpit Tools' own automatic refresh. If
 Cockpit Tools is not running, this viewer shows the last cached quota.
 

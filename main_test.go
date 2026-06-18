@@ -128,6 +128,119 @@ func TestLoadUsageFromSQLite(t *testing.T) {
 	}
 }
 
+func TestLoadUsageFromSQLiteIncludesModelAccountBreakdown(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codex_local_access_logs.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE request_logs (
+			timestamp INTEGER NOT NULL,
+			account_id TEXT NOT NULL DEFAULT '',
+			email TEXT NOT NULL DEFAULT '',
+			model_id TEXT NOT NULL,
+			success INTEGER NOT NULL,
+			input_tokens INTEGER NOT NULL,
+			output_tokens INTEGER NOT NULL,
+			total_tokens INTEGER NOT NULL,
+			cached_tokens INTEGER NOT NULL,
+			reasoning_tokens INTEGER NOT NULL,
+			estimated_cost_usd REAL NOT NULL
+		);
+		INSERT INTO request_logs VALUES
+			(?, 'account-a', 'alice@example.com', 'gpt-5.5', 1, 10, 5, 15, 3, 1, 1.25),
+			(?, 'account-b', 'bob@example.com', 'gpt-5.5', 1, 20, 8, 28, 4, 2, 2.50),
+			(?, 'account-b', 'bob@example.com', 'gpt-5.5', 0, 1, 0, 1, 0, 0, 0.50),
+			(?, 'account-a', 'alice@example.com', 'gpt-5-codex', 1, 4, 2, 6, 1, 0, 0.25);
+	`, time.Now().Unix(), time.Now().Unix(), time.Now().Unix(), time.Now().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	usage := loadUsageFromSQLite(path)
+	model := findModel(t, usage.Models, "gpt-5.5")
+	if model.Usage.RequestCount != 3 {
+		t.Fatalf("model request count = %d, want 3", model.Usage.RequestCount)
+	}
+	if len(model.Accounts) != 2 {
+		t.Fatalf("account breakdown len = %d, want 2: %+v", len(model.Accounts), model.Accounts)
+	}
+	if model.Accounts[0].Account != "b***@**.com" || model.Accounts[0].Usage.RequestCount != 2 {
+		t.Fatalf("first account = %+v", model.Accounts[0])
+	}
+	if model.Accounts[1].Account != "a***@**.com" || model.Accounts[1].Usage.RequestCount != 1 {
+		t.Fatalf("second account = %+v", model.Accounts[1])
+	}
+}
+
+func TestLoadUsageAugmentsStatsJSONWithSQLiteModelAccounts(t *testing.T) {
+	dir := t.TempDir()
+	stats := `{
+		"since": 1700000000,
+		"updatedAt": 1700000300,
+		"daily": {"totals": {}, "models": []},
+		"weekly": {"totals": {}, "models": []},
+		"monthly": {
+			"since": 1700000000,
+			"totals": {"requestCount": 3, "estimatedCostUsd": 4.25},
+			"models": [
+				{"modelId": "gpt-5.5", "usage": {"requestCount": 3, "estimatedCostUsd": 4.25}}
+			]
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "codex_local_access_stats.json"), []byte(stats), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "codex_local_access_logs.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE request_logs (
+			timestamp INTEGER NOT NULL,
+			account_id TEXT NOT NULL DEFAULT '',
+			email TEXT NOT NULL DEFAULT '',
+			model_id TEXT NOT NULL,
+			success INTEGER NOT NULL,
+			input_tokens INTEGER NOT NULL,
+			output_tokens INTEGER NOT NULL,
+			total_tokens INTEGER NOT NULL,
+			cached_tokens INTEGER NOT NULL,
+			reasoning_tokens INTEGER NOT NULL,
+			estimated_cost_usd REAL NOT NULL
+		);
+		INSERT INTO request_logs VALUES
+			(1700000100, 'account-a', 'alice@example.com', 'gpt-5.5', 1, 10, 5, 15, 3, 1, 1.25),
+			(1700000200, 'account-b', 'bob@example.com', 'gpt-5.5', 1, 20, 8, 28, 4, 2, 2.50),
+			(1700000300, 'account-b', 'bob@example.com', 'gpt-5.5', 0, 1, 0, 1, 0, 0, 0.50);
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	usage := loadUsage(dir)
+	if usage.Source != "stats-json" {
+		t.Fatalf("source = %q, want stats-json", usage.Source)
+	}
+	model := findModel(t, usage.Models, "gpt-5.5")
+	if len(model.Accounts) != 2 {
+		t.Fatalf("account breakdown len = %d, want 2: %+v", len(model.Accounts), model.Accounts)
+	}
+	if model.Accounts[0].Account != "b***@**.com" || model.Accounts[0].Usage.RequestCount != 2 {
+		t.Fatalf("first account = %+v", model.Accounts[0])
+	}
+}
+
 func TestRefreshIntervalConfig(t *testing.T) {
 	t.Setenv("LISTEN_ADDR", ":9090")
 	t.Setenv("DATA_DIR", "/tmp/codex-data")
@@ -193,7 +306,14 @@ func TestDashboardTemplateRendersNewLayout(t *testing.T) {
 			Daily:        usageTotals{RequestCount: 10, SuccessCount: 9, FailureCount: 1, TotalLatencyMs: 5000},
 			Weekly:       usageTotals{RequestCount: 20, SuccessCount: 18, FailureCount: 2, TotalLatencyMs: 12_000},
 			Monthly:      usageTotals{RequestCount: 20, SuccessCount: 18, FailureCount: 2, TotalLatencyMs: 12_000, EstimatedCostUSD: 0.02},
-			Models:       []modelUsage{{ModelID: "gpt-5-codex", Usage: usageTotals{RequestCount: 20, EstimatedCostUSD: 0.02}}},
+			Models: []modelUsage{{
+				ModelID: "gpt-5-codex",
+				Usage:   usageTotals{RequestCount: 20, EstimatedCostUSD: 0.02},
+				Accounts: []accountUsage{{
+					Account: "m***@**.com",
+					Usage:   usageTotals{RequestCount: 12, EstimatedCostUSD: 0.012},
+				}},
+			}},
 		},
 	}
 	var out bytes.Buffer
@@ -201,7 +321,7 @@ func TestDashboardTemplateRendersNewLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	html := out.String()
-	for _, want := range []string{"data-refresh-seconds=\"300\"", "模型请求排行", "gpt-5-codex", "生成 2026-06-04 13:30:00"} {
+	for _, want := range []string{"data-refresh-seconds=\"300\"", "模型请求排行", "gpt-5-codex", "m***@**.com", "生成 2026-06-04 13:30:00"} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("rendered html missing %q", want)
 		}
@@ -209,4 +329,15 @@ func TestDashboardTemplateRendersNewLayout(t *testing.T) {
 	if strings.Contains(html, "账号数") || strings.Contains(html, "最低 5h 额度") {
 		t.Fatalf("rendered html still contains removed summary metrics")
 	}
+}
+
+func findModel(t *testing.T, models []modelUsage, modelID string) modelUsage {
+	t.Helper()
+	for _, model := range models {
+		if model.ModelID == modelID {
+			return model
+		}
+	}
+	t.Fatalf("model %q not found in %+v", modelID, models)
+	return modelUsage{}
 }
