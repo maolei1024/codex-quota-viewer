@@ -11,8 +11,12 @@ services:
       DATA_DIR: /data
       LISTEN_ADDR: :8080
       STALE_AFTER_MINUTES: "30"
+      WEEKLY_RESET_NOTIFY_URL: https://mlntfy.project.k3s.ixuni.win/api/notifications/simple/send/mlNtfy
+      WEEKLY_RESET_NOTIFY_STATE_DIR: /state
+      WEEKLY_RESET_NOTIFY_TIMEOUT_SECONDS: "10"
     volumes:
       - ${HOME}/.antigravity_cockpit:/data:ro
+      - ${HOME}/.antigravity_cockpit/codex_quota_viewer_state:/state
     read_only: true
     tmpfs:
       - /tmp

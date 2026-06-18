@@ -6,6 +6,9 @@ The service does not call OpenAI and does not modify Cockpit Tools data. It read
 the mounted Cockpit data directory, masks account identities, and renders a
 human-oriented dashboard.
 
+When configured, it can also send a webhook notification when a Codex account's
+weekly quota window resets.
+
 ## Data Sources
 
 Mount the Cockpit Tools data directory as `/data:ro`:
@@ -27,6 +30,31 @@ model row.
 Codex quota data is only as fresh as Cockpit Tools' own automatic refresh. If
 Cockpit Tools is not running, this viewer shows the last cached quota.
 
+## Weekly Reset Notifications
+
+The viewer can send a webhook when an account's weekly quota reset time is
+reached, or when the cached weekly reset time jumps forward before the previous
+reset time was reached. The second case catches early quota resets caused by
+OpenAI incidents or temporary user rewards.
+
+Notifications are deduplicated per account and reset timestamp. The state is
+stored in `WEEKLY_RESET_NOTIFY_STATE_DIR` so restarts do not resend the same
+reset notification.
+
+The default compose file sends JSON notifications to:
+
+```text
+https://mlntfy.project.k3s.ixuni.win/api/notifications/simple/send/mlNtfy
+```
+
+The JSON body uses:
+
+- `title`: `Codex 周额度已重置`
+- `priority`: `high`
+- `tags`: `codex,quota,weekly-reset`
+- `message`: masked account, weekly remaining percentage, observed reset time,
+  and current next reset time
+
 ## Privacy
 
 The dashboard and JSON APIs never return raw emails, account IDs, API key IDs,
@@ -41,6 +69,8 @@ Email masking examples:
 ## Run With Docker Compose
 
 ```bash
+mkdir -p "${HOME}/.antigravity_cockpit/codex_quota_viewer_state"
+
 UID=$(id -u) GID=$(id -g) \
 docker compose up -d
 ```
@@ -67,6 +97,10 @@ Environment variables:
 | `LISTEN_ADDR` | `:8080` | HTTP listen address inside the container |
 | `DATA_DIR` | `/data` | Mounted Cockpit Tools data directory |
 | `STALE_AFTER_MINUTES` | `30` | Mark quota cache as stale after this many minutes |
+| `REFRESH_INTERVAL_SECONDS` | `300` | Dashboard refresh and weekly reset check interval |
+| `WEEKLY_RESET_NOTIFY_URL` | empty | Webhook URL. Leave empty to disable reset notifications |
+| `WEEKLY_RESET_NOTIFY_STATE_DIR` | `/state` | Writable directory for reset notification dedupe state |
+| `WEEKLY_RESET_NOTIFY_TIMEOUT_SECONDS` | `10` | Webhook request timeout |
 
 ## Endpoints
 

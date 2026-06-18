@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -24,13 +26,18 @@ const (
 	defaultDataDir         = "/data"
 	defaultStaleAfter      = 30 * time.Minute
 	defaultRefreshInterval = 5 * time.Minute
+	defaultNotifyStateDir  = "/state"
+	defaultNotifyTimeout   = 10 * time.Second
 )
 
 type config struct {
-	ListenAddr string
-	DataDir    string
-	StaleAfter time.Duration
-	Refresh    time.Duration
+	ListenAddr                string
+	DataDir                   string
+	StaleAfter                time.Duration
+	Refresh                   time.Duration
+	WeeklyResetNotifyURL      string
+	WeeklyResetNotifyStateDir string
+	WeeklyResetNotifyTimeout  time.Duration
 }
 
 type rawAccount struct {
@@ -61,6 +68,7 @@ type rawQuotaError struct {
 }
 
 type accountView struct {
+	AccountKey        string      `json:"-"`
 	Email             string      `json:"email"`
 	AuthMode          string      `json:"authMode"`
 	PlanType          string      `json:"planType"`
@@ -163,9 +171,35 @@ type rawModelStats struct {
 	Usage   usageTotals `json:"usage"`
 }
 
+const weeklyResetReminderStateFile = "weekly_reset_notifications.json"
+
+type weeklyResetReminderState struct {
+	Accounts map[string]weeklyResetAccountState `json:"accounts"`
+}
+
+type weeklyResetAccountState struct {
+	Account         string `json:"account,omitempty"`
+	ObservedResetAt int64  `json:"observedResetAt,omitempty"`
+	NotifiedResetAt int64  `json:"notifiedResetAt,omitempty"`
+	UpdatedAt       int64  `json:"updatedAt,omitempty"`
+}
+
+type simpleNotificationPayload struct {
+	Message  string `json:"message"`
+	Title    string `json:"title,omitempty"`
+	Priority string `json:"priority,omitempty"`
+	Tags     string `json:"tags,omitempty"`
+}
+
+type simpleNotificationResponse struct {
+	Success *bool  `json:"success"`
+	Error   string `json:"error"`
+}
+
 func main() {
 	cfg := loadConfig()
 	app := &server{cfg: cfg, tmpl: template.Must(template.New("dashboard").Funcs(dashboardFuncs()).Parse(dashboardHTML))}
+	app.startBackgroundTasks()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", app.handleDashboard)
@@ -199,6 +233,31 @@ type server struct {
 	tmpl *template.Template
 }
 
+func (s *server) startBackgroundTasks() {
+	if strings.TrimSpace(s.cfg.WeeklyResetNotifyURL) == "" {
+		return
+	}
+	interval := s.cfg.Refresh
+	if interval <= 0 {
+		interval = defaultRefreshInterval
+	}
+	client := &http.Client{Timeout: s.cfg.WeeklyResetNotifyTimeout}
+	go func() {
+		s.checkWeeklyResetNotifications(client)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.checkWeeklyResetNotifications(client)
+		}
+	}()
+}
+
+func (s *server) checkWeeklyResetNotifications(client *http.Client) {
+	if err := checkWeeklyResetNotifications(s.cfg, time.Now(), client); err != nil {
+		log.Printf("weekly reset notification check: %v", err)
+	}
+}
+
 func loadConfig() config {
 	listenAddr := strings.TrimSpace(os.Getenv("LISTEN_ADDR"))
 	if listenAddr == "" {
@@ -220,7 +279,26 @@ func loadConfig() config {
 			refresh = time.Duration(seconds) * time.Second
 		}
 	}
-	return config{ListenAddr: listenAddr, DataDir: filepath.Clean(dataDir), StaleAfter: staleAfter, Refresh: refresh}
+	notifyURL := strings.TrimSpace(os.Getenv("WEEKLY_RESET_NOTIFY_URL"))
+	notifyStateDir := strings.TrimSpace(os.Getenv("WEEKLY_RESET_NOTIFY_STATE_DIR"))
+	if notifyStateDir == "" {
+		notifyStateDir = defaultNotifyStateDir
+	}
+	notifyTimeout := defaultNotifyTimeout
+	if raw := strings.TrimSpace(os.Getenv("WEEKLY_RESET_NOTIFY_TIMEOUT_SECONDS")); raw != "" {
+		if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+			notifyTimeout = time.Duration(seconds) * time.Second
+		}
+	}
+	return config{
+		ListenAddr:                listenAddr,
+		DataDir:                   filepath.Clean(dataDir),
+		StaleAfter:                staleAfter,
+		Refresh:                   refresh,
+		WeeklyResetNotifyURL:      notifyURL,
+		WeeklyResetNotifyStateDir: filepath.Clean(notifyStateDir),
+		WeeklyResetNotifyTimeout:  notifyTimeout,
+	}
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -341,7 +419,9 @@ func loadAccounts(cfg config) ([]accountView, error) {
 			log.Printf("parse account %s: %v", entry.Name(), err)
 			continue
 		}
-		accounts = append(accounts, account.toView(cfg.StaleAfter))
+		view := account.toView(cfg.StaleAfter)
+		view.AccountKey = strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		accounts = append(accounts, view)
 	}
 	sort.Slice(accounts, func(i, j int) bool {
 		if accounts[i].Stale != accounts[j].Stale {
@@ -410,6 +490,166 @@ func buildWindow(present *bool, remaining int, resetAt *int64, windowMinutes *in
 
 func missingWindow() quotaWindow {
 	return quotaWindow{Present: false, Remaining: 0, ResetLabel: "-", Window: "-", Class: "unknown"}
+}
+
+func checkWeeklyResetNotifications(cfg config, now time.Time, client *http.Client) error {
+	if strings.TrimSpace(cfg.WeeklyResetNotifyURL) == "" {
+		return nil
+	}
+	if client == nil {
+		client = &http.Client{Timeout: cfg.WeeklyResetNotifyTimeout}
+	}
+	accounts, err := loadAccounts(cfg)
+	if err != nil {
+		return err
+	}
+	statePath := filepath.Join(cfg.WeeklyResetNotifyStateDir, weeklyResetReminderStateFile)
+	state, err := loadWeeklyResetReminderState(statePath)
+	if err != nil {
+		return err
+	}
+
+	nowUnix := now.Unix()
+	var firstErr error
+	for _, account := range accounts {
+		if !account.Weekly.Present || account.Weekly.ResetAt == nil || *account.Weekly.ResetAt <= 0 {
+			continue
+		}
+		accountKey := strings.TrimSpace(account.AccountKey)
+		if accountKey == "" {
+			accountKey = account.Email
+		}
+		currentResetAt := *account.Weekly.ResetAt
+		accountState := state.Accounts[accountKey]
+		accountState.Account = account.Email
+		accountState.UpdatedAt = nowUnix
+
+		observedResetAt := accountState.ObservedResetAt
+		if observedResetAt <= 0 {
+			observedResetAt = currentResetAt
+		}
+		rolledForward := accountState.ObservedResetAt > 0 && currentResetAt > accountState.ObservedResetAt
+		reachedObservedReset := observedResetAt <= nowUnix
+		needsNotification := accountState.NotifiedResetAt != observedResetAt && (reachedObservedReset || rolledForward)
+
+		if needsNotification {
+			if err := sendWeeklyResetNotification(client, cfg.WeeklyResetNotifyURL, account, observedResetAt, currentResetAt); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				state.Accounts[accountKey] = accountState
+				continue
+			}
+			accountState.NotifiedResetAt = observedResetAt
+		}
+		if currentResetAt > accountState.ObservedResetAt {
+			accountState.ObservedResetAt = currentResetAt
+		}
+		state.Accounts[accountKey] = accountState
+	}
+	if err := saveWeeklyResetReminderState(statePath, state); err != nil {
+		return err
+	}
+	return firstErr
+}
+
+func loadWeeklyResetReminderState(path string) (weeklyResetReminderState, error) {
+	state := weeklyResetReminderState{Accounts: map[string]weeklyResetAccountState{}}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return state, nil
+		}
+		return state, fmt.Errorf("read weekly reset notification state: %w", err)
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return state, nil
+	}
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return state, fmt.Errorf("parse weekly reset notification state: %w", err)
+	}
+	if state.Accounts == nil {
+		state.Accounts = map[string]weeklyResetAccountState{}
+	}
+	return state, nil
+}
+
+func saveWeeklyResetReminderState(path string, state weeklyResetReminderState) error {
+	if state.Accounts == nil {
+		state.Accounts = map[string]weeklyResetAccountState{}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create weekly reset notification state dir: %w", err)
+	}
+	raw, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal weekly reset notification state: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".weekly-reset-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create weekly reset notification state temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(raw); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write weekly reset notification state temp file: %w", err)
+	}
+	if _, err := tmp.Write([]byte("\n")); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write weekly reset notification state newline: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close weekly reset notification state temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace weekly reset notification state: %w", err)
+	}
+	return nil
+}
+
+func sendWeeklyResetNotification(client *http.Client, url string, account accountView, resetAt, nextResetAt int64) error {
+	payload := simpleNotificationPayload{
+		Title:    "Codex 周额度已重置",
+		Priority: "high",
+		Tags:     "codex,quota,weekly-reset",
+		Message: strings.Join([]string{
+			"Codex 周额度已重置",
+			"账号: " + account.Email,
+			fmt.Sprintf("周剩余: %d%%", account.Weekly.Remaining),
+			"重置时间: " + formatTime(resetAt),
+			"当前下次重置: " + formatTime(nextResetAt),
+		}, "\n"),
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal weekly reset notification: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	if err != nil {
+		return fmt.Errorf("build weekly reset notification request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send weekly reset notification: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("send weekly reset notification: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return nil
+	}
+	var result simpleNotificationResponse
+	if err := json.Unmarshal(body, &result); err == nil && result.Success != nil && !*result.Success {
+		if result.Error == "" {
+			result.Error = "notification service returned success=false"
+		}
+		return errors.New(result.Error)
+	}
+	return nil
 }
 
 func loadUsage(dataDir string) usageView {
