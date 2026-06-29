@@ -180,10 +180,11 @@ type weeklyResetReminderState struct {
 }
 
 type weeklyResetAccountState struct {
-	Account         string `json:"account,omitempty"`
-	ObservedResetAt int64  `json:"observedResetAt,omitempty"`
-	NotifiedResetAt int64  `json:"notifiedResetAt,omitempty"`
-	UpdatedAt       int64  `json:"updatedAt,omitempty"`
+	Account                  string `json:"account,omitempty"`
+	ObservedResetAt          int64  `json:"observedResetAt,omitempty"`
+	NotifiedResetAt          int64  `json:"notifiedResetAt,omitempty"`
+	SuppressFutureJumpsUntil int64  `json:"suppressFutureJumpsUntil,omitempty"`
+	UpdatedAt                int64  `json:"updatedAt,omitempty"`
 }
 
 type simpleNotificationPayload struct {
@@ -526,12 +527,14 @@ func checkWeeklyResetNotifications(cfg config, now time.Time, client *http.Clien
 		accountState.Account = account.Email
 		accountState.UpdatedAt = nowUnix
 
-		observedResetAt := accountState.ObservedResetAt
+		previousObservedResetAt := accountState.ObservedResetAt
+		observedResetAt := previousObservedResetAt
 		if observedResetAt <= 0 {
 			observedResetAt = currentResetAt
 		}
-		resetJump := time.Duration(currentResetAt-accountState.ObservedResetAt) * time.Second
-		rolledForward := accountState.ObservedResetAt > 0 && resetJump >= minWeeklyResetJump
+		resetJump := time.Duration(currentResetAt-previousObservedResetAt) * time.Second
+		futureJumpSuppressed := accountState.SuppressFutureJumpsUntil > nowUnix
+		rolledForward := previousObservedResetAt > 0 && resetJump >= minWeeklyResetJump && !futureJumpSuppressed
 		reachedObservedReset := observedResetAt <= nowUnix
 		needsNotification := accountState.NotifiedResetAt != observedResetAt && (reachedObservedReset || rolledForward)
 
@@ -544,9 +547,15 @@ func checkWeeklyResetNotifications(cfg config, now time.Time, client *http.Clien
 				continue
 			}
 			accountState.NotifiedResetAt = observedResetAt
+			if currentResetAt > observedResetAt {
+				accountState.SuppressFutureJumpsUntil = currentResetAt
+			}
 		}
 		if currentResetAt > accountState.ObservedResetAt {
 			accountState.ObservedResetAt = currentResetAt
+			if futureJumpSuppressed {
+				accountState.SuppressFutureJumpsUntil = currentResetAt
+			}
 		}
 		state.Accounts[accountKey] = accountState
 	}

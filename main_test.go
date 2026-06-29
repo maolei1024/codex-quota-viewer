@@ -407,6 +407,120 @@ func TestWeeklyResetNotifierSendsWebhookWhenFutureResetJumpsForward(t *testing.T
 	if accountState.ObservedResetAt != nextReset {
 		t.Fatalf("observed reset = %d, want %d", accountState.ObservedResetAt, nextReset)
 	}
+	rawAccountState := readWeeklyResetAccountStateRaw(t, stateDir, "account-a")
+	if got := requireStateInt64(t, rawAccountState, "suppressFutureJumpsUntil"); got != nextReset {
+		t.Fatalf("suppress future jumps until = %d, want %d", got, nextReset)
+	}
+}
+
+func TestWeeklyResetNotifierSuppressesRepeatedFutureResetJumpUntilNextCycle(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := t.TempDir()
+	now := time.Unix(1_780_000_000, 0)
+	firstObservedReset := now.Add(time.Hour).Unix()
+	firstNextReset := now.Add(7 * 24 * time.Hour).Unix()
+	extendedNextReset := firstNextReset + int64(30*time.Minute/time.Second)
+	writeTestAccount(t, dir, "account-a", "alice@example.com", 96, extendedNextReset)
+	writeWeeklyResetAccountStateRaw(t, stateDir, "account-a", map[string]any{
+		"account":                  "a***@**.com",
+		"observedResetAt":          firstNextReset,
+		"notifiedResetAt":          firstObservedReset,
+		"suppressFutureJumpsUntil": firstNextReset,
+		"updatedAt":                now.Unix(),
+	})
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		t.Fatalf("unexpected webhook request")
+	}))
+	defer server.Close()
+
+	cfg := config{
+		DataDir:                   dir,
+		StaleAfter:                30 * time.Minute,
+		WeeklyResetNotifyURL:      server.URL + "/api/notifications/simple/send/mlNtfy",
+		WeeklyResetNotifyStateDir: stateDir,
+		WeeklyResetNotifyTimeout:  time.Second,
+	}
+	if err := checkWeeklyResetNotifications(cfg, now, server.Client()); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want 0", requests)
+	}
+
+	state, err := loadWeeklyResetReminderState(filepath.Join(stateDir, weeklyResetReminderStateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountState := state.Accounts["account-a"]
+	if accountState.NotifiedResetAt != firstObservedReset {
+		t.Fatalf("notified reset = %d, want %d", accountState.NotifiedResetAt, firstObservedReset)
+	}
+	if accountState.ObservedResetAt != extendedNextReset {
+		t.Fatalf("observed reset = %d, want %d", accountState.ObservedResetAt, extendedNextReset)
+	}
+	rawAccountState := readWeeklyResetAccountStateRaw(t, stateDir, "account-a")
+	if got := requireStateInt64(t, rawAccountState, "suppressFutureJumpsUntil"); got != extendedNextReset {
+		t.Fatalf("suppress future jumps until = %d, want %d", got, extendedNextReset)
+	}
+}
+
+func TestWeeklyResetNotifierAllowsFutureResetJumpAfterSuppressionExpires(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := t.TempDir()
+	now := time.Unix(1_780_000_000, 0)
+	previousObservedReset := now.Add(time.Hour).Unix()
+	expiredSuppressUntil := now.Add(-time.Minute).Unix()
+	nextReset := now.Add(7 * 24 * time.Hour).Unix()
+	writeTestAccount(t, dir, "account-a", "alice@example.com", 99, nextReset)
+	writeWeeklyResetAccountStateRaw(t, stateDir, "account-a", map[string]any{
+		"account":                  "a***@**.com",
+		"observedResetAt":          previousObservedReset,
+		"notifiedResetAt":          expiredSuppressUntil,
+		"suppressFutureJumpsUntil": expiredSuppressUntil,
+		"updatedAt":                now.Unix(),
+	})
+
+	var gotPayload map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+	}))
+	defer server.Close()
+
+	cfg := config{
+		DataDir:                   dir,
+		StaleAfter:                30 * time.Minute,
+		WeeklyResetNotifyURL:      server.URL + "/api/notifications/simple/send/mlNtfy",
+		WeeklyResetNotifyStateDir: stateDir,
+		WeeklyResetNotifyTimeout:  time.Second,
+	}
+	if err := checkWeeklyResetNotifications(cfg, now, server.Client()); err != nil {
+		t.Fatal(err)
+	}
+	if gotPayload["title"] != "Codex 周额度已重置" {
+		t.Fatalf("title = %q", gotPayload["title"])
+	}
+
+	state, err := loadWeeklyResetReminderState(filepath.Join(stateDir, weeklyResetReminderStateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountState := state.Accounts["account-a"]
+	if accountState.NotifiedResetAt != previousObservedReset {
+		t.Fatalf("notified reset = %d, want %d", accountState.NotifiedResetAt, previousObservedReset)
+	}
+	if accountState.ObservedResetAt != nextReset {
+		t.Fatalf("observed reset = %d, want %d", accountState.ObservedResetAt, nextReset)
+	}
+	rawAccountState := readWeeklyResetAccountStateRaw(t, stateDir, "account-a")
+	if got := requireStateInt64(t, rawAccountState, "suppressFutureJumpsUntil"); got != nextReset {
+		t.Fatalf("suppress future jumps until = %d, want %d", got, nextReset)
+	}
 }
 
 func TestWeeklyResetNotifierDoesNotSendDuplicateWebhook(t *testing.T) {
@@ -604,4 +718,55 @@ func writeTestAccount(t *testing.T, dir, id, email string, weeklyRemaining int, 
 	if err := os.WriteFile(filepath.Join(accountsDir, id+".json"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func writeWeeklyResetAccountStateRaw(t *testing.T, stateDir, accountKey string, accountState map[string]any) {
+	t.Helper()
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state := map[string]any{
+		"accounts": map[string]any{
+			accountKey: accountState,
+		},
+	}
+	raw, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, weeklyResetReminderStateFile), append(raw, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readWeeklyResetAccountStateRaw(t *testing.T, stateDir, accountKey string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(stateDir, weeklyResetReminderStateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state struct {
+		Accounts map[string]map[string]any `json:"accounts"`
+	}
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatal(err)
+	}
+	accountState, ok := state.Accounts[accountKey]
+	if !ok {
+		t.Fatalf("state missing account %q: %+v", accountKey, state.Accounts)
+	}
+	return accountState
+}
+
+func requireStateInt64(t *testing.T, accountState map[string]any, field string) int64 {
+	t.Helper()
+	value, ok := accountState[field]
+	if !ok {
+		t.Fatalf("state missing %q: %+v", field, accountState)
+	}
+	number, ok := value.(float64)
+	if !ok {
+		t.Fatalf("state field %q = %T(%v), want number", field, value, value)
+	}
+	return int64(number)
 }
