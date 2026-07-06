@@ -180,11 +180,13 @@ type weeklyResetReminderState struct {
 }
 
 type weeklyResetAccountState struct {
-	Account                  string `json:"account,omitempty"`
-	ObservedResetAt          int64  `json:"observedResetAt,omitempty"`
-	NotifiedResetAt          int64  `json:"notifiedResetAt,omitempty"`
-	SuppressFutureJumpsUntil int64  `json:"suppressFutureJumpsUntil,omitempty"`
-	UpdatedAt                int64  `json:"updatedAt,omitempty"`
+	Account                     string `json:"account,omitempty"`
+	ObservedResetAt             int64  `json:"observedResetAt,omitempty"`
+	NotifiedResetAt             int64  `json:"notifiedResetAt,omitempty"`
+	NotifiedStaleUsageUpdatedAt int64  `json:"notifiedStaleUsageUpdatedAt,omitempty"`
+	NotifiedStaleAt             int64  `json:"notifiedStaleAt,omitempty"`
+	SuppressFutureJumpsUntil    int64  `json:"suppressFutureJumpsUntil,omitempty"`
+	UpdatedAt                   int64  `json:"updatedAt,omitempty"`
 }
 
 type simpleNotificationPayload struct {
@@ -257,7 +259,7 @@ func (s *server) startBackgroundTasks() {
 
 func (s *server) checkWeeklyResetNotifications(client *http.Client) {
 	if err := checkWeeklyResetNotifications(s.cfg, time.Now(), client); err != nil {
-		log.Printf("weekly reset notification check: %v", err)
+		log.Printf("quota notification check: %v", err)
 	}
 }
 
@@ -397,6 +399,10 @@ func (s *server) buildSummary() summaryView {
 }
 
 func loadAccounts(cfg config) ([]accountView, error) {
+	return loadAccountsAt(cfg, time.Now())
+}
+
+func loadAccountsAt(cfg config, now time.Time) ([]accountView, error) {
 	dir := filepath.Join(cfg.DataDir, "codex_accounts")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -422,7 +428,7 @@ func loadAccounts(cfg config) ([]accountView, error) {
 			log.Printf("parse account %s: %v", entry.Name(), err)
 			continue
 		}
-		view := account.toView(cfg.StaleAfter)
+		view := account.toViewAt(cfg.StaleAfter, now)
 		view.AccountKey = strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
 		accounts = append(accounts, view)
 	}
@@ -436,7 +442,10 @@ func loadAccounts(cfg config) ([]accountView, error) {
 }
 
 func (a rawAccount) toView(staleAfter time.Duration) accountView {
-	now := time.Now()
+	return a.toViewAt(staleAfter, time.Now())
+}
+
+func (a rawAccount) toViewAt(staleAfter time.Duration, now time.Time) accountView {
 	view := accountView{
 		Email:             maskIdentity(a.Email),
 		AuthMode:          dash(a.AuthMode),
@@ -502,7 +511,7 @@ func checkWeeklyResetNotifications(cfg config, now time.Time, client *http.Clien
 	if client == nil {
 		client = &http.Client{Timeout: cfg.WeeklyResetNotifyTimeout}
 	}
-	accounts, err := loadAccounts(cfg)
+	accounts, err := loadAccountsAt(cfg, now)
 	if err != nil {
 		return err
 	}
@@ -515,18 +524,33 @@ func checkWeeklyResetNotifications(cfg config, now time.Time, client *http.Clien
 	nowUnix := now.Unix()
 	var firstErr error
 	for _, account := range accounts {
-		if !account.Weekly.Present || account.Weekly.ResetAt == nil || *account.Weekly.ResetAt <= 0 {
-			continue
-		}
 		accountKey := strings.TrimSpace(account.AccountKey)
 		if accountKey == "" {
 			accountKey = account.Email
 		}
-		currentResetAt := *account.Weekly.ResetAt
-		accountState := state.Accounts[accountKey]
+		accountState, hadAccountState := state.Accounts[accountKey]
 		accountState.Account = account.Email
 		accountState.UpdatedAt = nowUnix
 
+		staleObserved := account.Stale && account.UsageUpdatedAt != nil && *account.UsageUpdatedAt > 0
+		if staleObserved && accountState.NotifiedStaleUsageUpdatedAt != *account.UsageUpdatedAt {
+			if err := sendStaleNotification(client, cfg.WeeklyResetNotifyURL, account, cfg.StaleAfter); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				accountState.NotifiedStaleUsageUpdatedAt = *account.UsageUpdatedAt
+				accountState.NotifiedStaleAt = nowUnix
+			}
+		}
+
+		if !account.Weekly.Present || account.Weekly.ResetAt == nil || *account.Weekly.ResetAt <= 0 {
+			if hadAccountState || staleObserved {
+				state.Accounts[accountKey] = accountState
+			}
+			continue
+		}
+		currentResetAt := *account.Weekly.ResetAt
 		previousObservedResetAt := accountState.ObservedResetAt
 		observedResetAt := previousObservedResetAt
 		if observedResetAt <= 0 {
@@ -633,23 +657,56 @@ func sendWeeklyResetNotification(client *http.Client, url string, account accoun
 			"当前下次重置: " + formatTime(nextResetAt),
 		}, "\n"),
 	}
+	return sendSimpleNotification(client, url, payload, "weekly reset notification")
+}
+
+func sendStaleNotification(client *http.Client, url string, account accountView, staleAfter time.Duration) error {
+	payload := simpleNotificationPayload{
+		Title:    "Codex 额度缓存已过期",
+		Priority: "high",
+		Tags:     "codex,quota,stale",
+		Message: strings.Join([]string{
+			"Codex 额度缓存已过期",
+			"账号: " + account.Email,
+			"Plan: " + account.PlanType,
+			"认证: " + account.AuthMode,
+			"5h 剩余: " + quotaRemainingLabel(account.Hourly),
+			"5h 重置: " + formatOptionalTime(account.Hourly.ResetAt),
+			"周剩余: " + quotaRemainingLabel(account.Weekly),
+			"周重置: " + formatOptionalTime(account.Weekly.ResetAt),
+			"缓存更新: " + account.UsageUpdatedLabel,
+			"过期阈值: " + durationLabel(staleAfter),
+			"状态: stale",
+		}, "\n"),
+	}
+	return sendSimpleNotification(client, url, payload, "stale notification")
+}
+
+func quotaRemainingLabel(window quotaWindow) string {
+	if !window.Present {
+		return "-"
+	}
+	return fmt.Sprintf("%d%%", window.Remaining)
+}
+
+func sendSimpleNotification(client *http.Client, url string, payload simpleNotificationPayload, label string) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal weekly reset notification: %w", err)
+		return fmt.Errorf("marshal %s: %w", label, err)
 	}
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
-		return fmt.Errorf("build weekly reset notification request: %w", err)
+		return fmt.Errorf("build %s request: %w", label, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send weekly reset notification: %w", err)
+		return fmt.Errorf("send %s: %w", label, err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("send weekly reset notification: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return fmt.Errorf("send %s: status %d: %s", label, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	if len(strings.TrimSpace(string(body))) == 0 {
 		return nil
@@ -659,7 +716,7 @@ func sendWeeklyResetNotification(client *http.Client, url string, account accoun
 		if result.Error == "" {
 			result.Error = "notification service returned success=false"
 		}
-		return errors.New(result.Error)
+		return fmt.Errorf("send %s: %s", label, result.Error)
 	}
 	return nil
 }
