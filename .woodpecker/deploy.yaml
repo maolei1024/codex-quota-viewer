@@ -19,7 +19,8 @@ steps:
         from_secret: nexus_password
 
   - name: notify-success
-    image: docker.nexus.ixuni.win/woodpecker-mlntfy:v4
+    image: docker.nexus.ixuni.win/woodpecker-mlntfy:latest
+    pull: true
     when:
       - status: [success]
     settings:
@@ -29,7 +30,8 @@ steps:
       tags: ci,success,deploy
 
   - name: notify-failure
-    image: docker.nexus.ixuni.win/woodpecker-mlntfy:v4
+    image: docker.nexus.ixuni.win/woodpecker-mlntfy:latest
+    pull: true
     when:
       - status: [failure]
     settings:
