@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +33,10 @@ const (
 	defaultNotifyStateDir  = "/state"
 	defaultNotifyTimeout   = 10 * time.Second
 	minWeeklyResetJump     = 5 * time.Minute
+	secureAccountKeyFile   = "secure-account-storage.key"
+	secureAccountVersion   = 1
+	unixMillisThreshold    = int64(100_000_000_000)
+	weeklyWindowMinutes    = int64(7 * 24 * 60)
 )
 
 type config struct {
@@ -50,6 +57,16 @@ type rawAccount struct {
 	QuotaError     *rawQuotaError  `json:"quota_error"`
 	UsageUpdatedAt *int64          `json:"usage_updated_at"`
 	Raw            json.RawMessage `json:"-"`
+}
+
+type secureAccountEnvelope struct {
+	Version     int    `json:"version"`
+	Kind        string `json:"kind"`
+	Algorithm   string `json:"algorithm"`
+	KeyID       string `json:"key_id"`
+	Nonce       string `json:"nonce"`
+	Ciphertext  string `json:"ciphertext"`
+	EncryptedAt int64  `json:"encrypted_at"`
 }
 
 type rawQuota struct {
@@ -89,6 +106,7 @@ type quotaWindow struct {
 	ResetLabel string `json:"resetLabel"`
 	Window     string `json:"window"`
 	Class      string `json:"class"`
+	Minutes    int64  `json:"-"`
 }
 
 type usageTotals struct {
@@ -423,6 +441,11 @@ func loadAccountsAt(cfg config, now time.Time) ([]accountView, error) {
 			log.Printf("read account %s: %v", entry.Name(), err)
 			continue
 		}
+		raw, err = decryptAccountFileIfNeeded(cfg.DataDir, raw)
+		if err != nil {
+			log.Printf("decrypt account %s: %v", entry.Name(), err)
+			continue
+		}
 		var account rawAccount
 		if err := json.Unmarshal(raw, &account); err != nil {
 			log.Printf("parse account %s: %v", entry.Name(), err)
@@ -441,6 +464,62 @@ func loadAccountsAt(cfg config, now time.Time) ([]accountView, error) {
 	return accounts, nil
 }
 
+func decryptAccountFileIfNeeded(dataDir string, raw []byte) ([]byte, error) {
+	var envelope secureAccountEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return raw, nil
+	}
+	if strings.TrimSpace(envelope.Ciphertext) == "" && strings.TrimSpace(envelope.Algorithm) == "" {
+		return raw, nil
+	}
+	if envelope.Version != secureAccountVersion {
+		return nil, fmt.Errorf("unsupported secure account version %d", envelope.Version)
+	}
+	if envelope.Kind != "" && envelope.Kind != "codex" {
+		return nil, fmt.Errorf("unexpected secure account kind %q", envelope.Kind)
+	}
+	if !strings.EqualFold(strings.TrimSpace(envelope.Algorithm), "AES-256-GCM") {
+		return nil, fmt.Errorf("unsupported secure account algorithm %q", envelope.Algorithm)
+	}
+
+	encodedKey, err := os.ReadFile(filepath.Join(dataDir, secureAccountKeyFile))
+	if err != nil {
+		return nil, fmt.Errorf("read secure account key: %w", err)
+	}
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(encodedKey)))
+	if err != nil {
+		return nil, fmt.Errorf("decode secure account key: %w", err)
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("invalid secure account key length %d", len(key))
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("initialize secure account cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("initialize secure account gcm: %w", err)
+	}
+	nonce, err := base64.StdEncoding.DecodeString(strings.TrimSpace(envelope.Nonce))
+	if err != nil {
+		return nil, fmt.Errorf("decode secure account nonce: %w", err)
+	}
+	if len(nonce) != gcm.NonceSize() {
+		return nil, fmt.Errorf("invalid secure account nonce length %d", len(nonce))
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(strings.TrimSpace(envelope.Ciphertext))
+	if err != nil {
+		return nil, fmt.Errorf("decode secure account ciphertext: %w", err)
+	}
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt secure account payload: %w", err)
+	}
+	return plaintext, nil
+}
+
 func (a rawAccount) toView(staleAfter time.Duration) accountView {
 	return a.toViewAt(staleAfter, time.Now())
 }
@@ -455,14 +534,15 @@ func (a rawAccount) toViewAt(staleAfter time.Duration, now time.Time) accountVie
 	}
 	if a.UsageUpdatedAt != nil {
 		view.UsageUpdatedLabel = formatTime(*a.UsageUpdatedAt)
-		view.Stale = now.Sub(time.Unix(*a.UsageUpdatedAt, 0)) > staleAfter
+		view.Stale = now.Sub(unixTime(*a.UsageUpdatedAt)) > staleAfter
 	}
 	if a.Quota == nil {
 		view.Hourly = missingWindow()
 		view.Weekly = missingWindow()
 	} else {
-		view.Hourly = buildWindow(a.Quota.HourlyWindowPresent, a.Quota.HourlyPercentage, a.Quota.HourlyResetTime, a.Quota.HourlyWindowMinutes)
-		view.Weekly = buildWindow(a.Quota.WeeklyWindowPresent, a.Quota.WeeklyPercentage, a.Quota.WeeklyResetTime, a.Quota.WeeklyWindowMinutes)
+		primary := buildWindow(a.Quota.HourlyWindowPresent, a.Quota.HourlyPercentage, a.Quota.HourlyResetTime, a.Quota.HourlyWindowMinutes)
+		secondary := buildWindow(a.Quota.WeeklyWindowPresent, a.Quota.WeeklyPercentage, a.Quota.WeeklyResetTime, a.Quota.WeeklyWindowMinutes)
+		view.Hourly, view.Weekly = classifyQuotaWindows(primary, secondary)
 	}
 	if a.QuotaError != nil {
 		if a.QuotaError.Code != nil && *a.QuotaError.Code != "" {
@@ -484,7 +564,9 @@ func buildWindow(present *bool, remaining int, resetAt *int64, windowMinutes *in
 	}
 	remaining = clamp(remaining, 0, 100)
 	window := "-"
+	var minutes int64
 	if windowMinutes != nil && *windowMinutes > 0 {
+		minutes = *windowMinutes
 		window = fmt.Sprintf("%dm", *windowMinutes)
 		if *windowMinutes%60 == 0 {
 			window = fmt.Sprintf("%dh", *windowMinutes/60)
@@ -497,7 +579,21 @@ func buildWindow(present *bool, remaining int, resetAt *int64, windowMinutes *in
 		ResetLabel: formatOptionalTime(resetAt),
 		Window:     window,
 		Class:      quotaClass(remaining),
+		Minutes:    minutes,
 	}
+}
+
+func classifyQuotaWindows(primary, secondary quotaWindow) (quotaWindow, quotaWindow) {
+	if primary.Present && secondary.Present && primary.Minutes > 0 && secondary.Minutes > 0 && primary.Minutes > secondary.Minutes {
+		return secondary, primary
+	}
+	if primary.Present && !secondary.Present && primary.Minutes >= weeklyWindowMinutes {
+		return missingWindow(), primary
+	}
+	if !primary.Present && secondary.Present && secondary.Minutes > 0 && secondary.Minutes < weeklyWindowMinutes {
+		return secondary, missingWindow()
+	}
+	return primary, secondary
 }
 
 func missingWindow() quotaWindow {
@@ -777,9 +873,9 @@ func loadUsageFromSQLite(path string) usageView {
 	defer db.Close()
 
 	now := time.Now()
-	dailySince := now.Add(-24 * time.Hour).Unix()
-	weeklySince := now.Add(-7 * 24 * time.Hour).Unix()
-	monthlySince := now.Add(-30 * 24 * time.Hour).Unix()
+	dailySince := sqliteTimestamp(db, now.Add(-24*time.Hour))
+	weeklySince := sqliteTimestamp(db, now.Add(-7*24*time.Hour))
+	monthlySince := sqliteTimestamp(db, now.Add(-30*24*time.Hour))
 	daily := queryUsageTotals(db, dailySince)
 	weekly := queryUsageTotals(db, weeklySince)
 	monthly := queryUsageTotals(db, monthlySince)
@@ -896,12 +992,61 @@ func attachModelAccountUsageFromSQLite(path string, since int64, models []modelU
 		return models
 	}
 	if since <= 0 {
-		since = time.Now().Add(-30 * 24 * time.Hour).Unix()
+		since = sqliteTimestamp(db, time.Now().Add(-30*24*time.Hour))
+	} else {
+		since = normalizeSQLiteTimestamp(db, since)
 	}
 	for i := range models {
 		models[i].Accounts = queryModelAccountUsage(db, since, models[i].ModelID)
+		reconcileAccountCosts(models[i].Accounts, models[i].Usage.EstimatedCostUSD)
 	}
 	return models
+}
+
+func reconcileAccountCosts(accounts []accountUsage, modelCost float64) {
+	if len(accounts) == 0 {
+		return
+	}
+	if modelCost <= 0 {
+		for i := range accounts {
+			accounts[i].Usage.EstimatedCostUSD = 0
+		}
+		return
+	}
+
+	weights := make([]float64, len(accounts))
+	var totalWeight float64
+	for i := range accounts {
+		weights[i] = math.Max(accounts[i].Usage.EstimatedCostUSD, 0)
+		totalWeight += weights[i]
+	}
+	if totalWeight <= 0 {
+		for i := range accounts {
+			weights[i] = float64(maxInt64(accounts[i].Usage.TotalTokens, accounts[i].Usage.RequestCount))
+			totalWeight += weights[i]
+		}
+	}
+	if totalWeight <= 0 {
+		return
+	}
+
+	var allocated float64
+	for i := range accounts {
+		if i == len(accounts)-1 {
+			accounts[i].Usage.EstimatedCostUSD = math.Max(modelCost-allocated, 0)
+			break
+		}
+		cost := modelCost * weights[i] / totalWeight
+		accounts[i].Usage.EstimatedCostUSD = cost
+		allocated += cost
+	}
+}
+
+func maxInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func queryModelAccountUsage(db *sql.DB, since int64, modelID string) []accountUsage {
@@ -992,6 +1137,35 @@ func sqliteReadOnlyDSN(path string) string {
 	query.Set("immutable", "1")
 	uri.RawQuery = query.Encode()
 	return uri.String()
+}
+
+func sqliteTimestamp(db *sql.DB, value time.Time) int64 {
+	if sqliteUsesMilliseconds(db) {
+		return value.UnixMilli()
+	}
+	return value.Unix()
+}
+
+func normalizeSQLiteTimestamp(db *sql.DB, value int64) int64 {
+	usesMillis := sqliteUsesMilliseconds(db)
+	isMillis := isUnixMilliseconds(value)
+	switch {
+	case usesMillis && !isMillis:
+		return value * 1000
+	case !usesMillis && isMillis:
+		return value / 1000
+	default:
+		return value
+	}
+}
+
+func sqliteUsesMilliseconds(db *sql.DB) bool {
+	var latest sql.NullInt64
+	if err := db.QueryRow("SELECT MAX(timestamp) FROM request_logs").Scan(&latest); err != nil {
+		log.Printf("inspect request_logs timestamp unit: %v", err)
+		return false
+	}
+	return latest.Valid && isUnixMilliseconds(latest.Int64)
 }
 
 func sortModels(models []modelUsage) {
@@ -1189,7 +1363,18 @@ func formatOptionalUnix(ts int64) string {
 }
 
 func formatTime(ts int64) string {
-	return time.Unix(ts, 0).Local().Format("2006-01-02 15:04:05")
+	return unixTime(ts).Local().Format("2006-01-02 15:04:05")
+}
+
+func unixTime(ts int64) time.Time {
+	if isUnixMilliseconds(ts) {
+		return time.UnixMilli(ts)
+	}
+	return time.Unix(ts, 0)
+}
+
+func isUnixMilliseconds(ts int64) bool {
+	return ts >= unixMillisThreshold || ts <= -unixMillisThreshold
 }
 
 var dashboardHTML = `<!doctype html>

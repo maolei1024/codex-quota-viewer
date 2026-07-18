@@ -14,8 +14,18 @@ weekly quota window resets or its quota cache becomes stale.
 Mount the Cockpit Tools data directory as `/data:ro`:
 
 - `/data/codex_accounts/*.json`
+- `/data/secure-account-storage.key` (Cockpit Tools 1.3.1 and newer)
 - `/data/codex_local_access_stats.json`
 - `/data/codex_local_access_logs.sqlite`
+
+Cockpit Tools 1.3.1 and newer stores per-account detail files in AES-256-GCM
+envelopes. The viewer decrypts those files in memory with the read-only mounted
+local key, then exposes only the same masked quota view as before. Plaintext
+account files remain supported for older Cockpit Tools versions.
+
+Quota windows are classified by their reported duration. This keeps a lone
+7-day primary window in the weekly column even when Cockpit stores it in its
+legacy `hourly_*` slot.
 
 `codex_local_access_stats.json` contains precomputed aggregate windows such as
 totals, account totals, model totals, and API key totals. It does not retain the
@@ -25,7 +35,13 @@ raw event list, so it cannot answer model-by-account breakdowns by itself.
 including timestamp, account id/email, API key id/label, model id, success
 status, latency, token counts, and estimated cost. When this file is mounted,
 the model request ranking includes a masked per-account breakdown for each
-model row.
+model row. When Cockpit's recalculated stats cost differs from historical costs
+stored per request, account costs are proportionally reconciled to the model
+total from the stats snapshot so the displayed figures use one cost basis.
+
+Both Unix-second and Unix-millisecond timestamps are accepted. Current Cockpit
+Tools statistics and request logs use milliseconds, while quota reset fields
+continue to use seconds.
 
 Codex quota data is only as fresh as Cockpit Tools' own automatic refresh. If
 Cockpit Tools is not running, this viewer shows the last cached quota.

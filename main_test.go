@@ -2,9 +2,13 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"html/template"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -86,6 +90,116 @@ func TestLoadAccountsReturnsOnlySanitizedView(t *testing.T) {
 	}
 }
 
+func TestLoadAccountsDecryptsCockpitSecureEnvelope(t *testing.T) {
+	dir := t.TempDir()
+	accountsDir := filepath.Join(dir, "codex_accounts")
+	if err := os.MkdirAll(accountsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	updatedAt := time.Now().Add(-5 * time.Minute).Unix()
+	plaintext := []byte(`{
+		"id": "encrypted-account-id",
+		"email": "alice@example.com",
+		"auth_mode": "oauth",
+		"plan_type": "Plus",
+		"quota": {
+			"hourly_percentage": 75,
+			"hourly_window_present": true,
+			"weekly_percentage": 55,
+			"weekly_window_present": true
+		},
+		"usage_updated_at": ` + strconv.FormatInt(updatedAt, 10) + `
+	}`)
+	key := bytes.Repeat([]byte{0x42}, 32)
+	if err := os.WriteFile(
+		filepath.Join(dir, secureAccountKeyFile),
+		[]byte(base64.StdEncoding.EncodeToString(key)),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := bytes.Repeat([]byte{0x24}, gcm.NonceSize())
+	envelope := secureAccountEnvelope{
+		Version:     secureAccountVersion,
+		Kind:        "codex",
+		Algorithm:   "AES-256-GCM",
+		KeyID:       "local-secure-account-storage-v1",
+		Nonce:       base64.StdEncoding.EncodeToString(nonce),
+		Ciphertext:  base64.StdEncoding.EncodeToString(gcm.Seal(nil, nonce, plaintext, nil)),
+		EncryptedAt: time.Now().Unix(),
+	}
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(accountsDir, "account.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	accounts, err := loadAccounts(config{DataDir: dir, StaleAfter: 30 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("got %d accounts, want 1", len(accounts))
+	}
+	account := accounts[0]
+	if account.Email != "a***@**.com" || account.AuthMode != "oauth" || account.PlanType != "Plus" {
+		t.Fatalf("unexpected decrypted account: %+v", account)
+	}
+	if account.Hourly.Remaining != 75 || account.Weekly.Remaining != 55 {
+		t.Fatalf("unexpected decrypted quota: %+v %+v", account.Hourly, account.Weekly)
+	}
+}
+
+func TestLoadAccountsClassifiesSingleSevenDayPrimaryWindowAsWeekly(t *testing.T) {
+	dir := t.TempDir()
+	accountsDir := filepath.Join(dir, "codex_accounts")
+	if err := os.MkdirAll(accountsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resetAt := time.Now().Add(7 * 24 * time.Hour).Unix()
+	content := `{
+		"email": "alice@example.com",
+		"auth_mode": "oauth",
+		"plan_type": "Plus",
+		"quota": {
+			"hourly_percentage": 67,
+			"hourly_reset_time": ` + strconv.FormatInt(resetAt, 10) + `,
+			"hourly_window_minutes": 10080,
+			"hourly_window_present": true,
+			"weekly_percentage": 100,
+			"weekly_window_present": false
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(accountsDir, "account.json"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	accounts, err := loadAccounts(config{DataDir: dir, StaleAfter: 30 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 1 {
+		t.Fatalf("got %d accounts, want 1", len(accounts))
+	}
+	account := accounts[0]
+	if account.Hourly.Present {
+		t.Fatalf("short quota window should be absent: %+v", account.Hourly)
+	}
+	if !account.Weekly.Present || account.Weekly.Remaining != 67 || account.Weekly.Window != "168h" {
+		t.Fatalf("seven-day primary window not classified as weekly: %+v", account.Weekly)
+	}
+}
+
 func TestLoadUsageFromSQLite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "codex_local_access_logs.sqlite")
@@ -128,6 +242,46 @@ func TestLoadUsageFromSQLite(t *testing.T) {
 	}
 	if len(usage.Models) != 1 || usage.Models[0].ModelID != "gpt-5-codex" {
 		t.Fatalf("models = %+v", usage.Models)
+	}
+}
+
+func TestLoadUsageFromSQLiteSupportsMillisecondTimestamps(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codex_local_access_logs.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	_, err = db.Exec(`
+		CREATE TABLE request_logs (
+			timestamp INTEGER NOT NULL,
+			model_id TEXT NOT NULL,
+			success INTEGER NOT NULL,
+			input_tokens INTEGER NOT NULL,
+			output_tokens INTEGER NOT NULL,
+			total_tokens INTEGER NOT NULL,
+			cached_tokens INTEGER NOT NULL,
+			reasoning_tokens INTEGER NOT NULL,
+			estimated_cost_usd REAL NOT NULL
+		);
+		INSERT INTO request_logs VALUES
+			(?, 'recent', 1, 10, 5, 15, 3, 1, 0.001),
+			(?, 'older', 1, 2, 1, 3, 0, 0, 0.0002);
+	`, now.Add(-2*time.Hour).UnixMilli(), now.Add(-48*time.Hour).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	usage := loadUsageFromSQLite(path)
+	if usage.Daily.RequestCount != 1 {
+		t.Fatalf("daily request count = %d, want 1", usage.Daily.RequestCount)
+	}
+	if usage.Weekly.RequestCount != 2 {
+		t.Fatalf("weekly request count = %d, want 2", usage.Weekly.RequestCount)
 	}
 }
 
@@ -253,6 +407,73 @@ func TestLoadUsageAugmentsStatsJSONWithSQLiteModelAccounts(t *testing.T) {
 	}
 	if model.Accounts[0].Account != "b***@**.com" || model.Accounts[0].Usage.RequestCount != 2 {
 		t.Fatalf("first account = %+v", model.Accounts[0])
+	}
+}
+
+func TestStatsJSONReconcilesAccountCostsToModelTotal(t *testing.T) {
+	dir := t.TempDir()
+	const since = int64(1_700_000_000_000)
+	stats := `{
+		"since": 1700000000000,
+		"updatedAt": 1700000300000,
+		"daily": {"totals": {}, "models": []},
+		"weekly": {"totals": {}, "models": []},
+		"monthly": {
+			"since": 1700000000000,
+			"totals": {"requestCount": 2, "estimatedCostUsd": 2},
+			"models": [
+				{"modelId": "gpt-5.5", "usage": {"requestCount": 2, "estimatedCostUsd": 2}}
+			]
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "codex_local_access_stats.json"), []byte(stats), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "codex_local_access_logs.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE request_logs (
+			timestamp INTEGER NOT NULL,
+			account_id TEXT NOT NULL DEFAULT '',
+			email TEXT NOT NULL DEFAULT '',
+			model_id TEXT NOT NULL,
+			success INTEGER NOT NULL,
+			input_tokens INTEGER NOT NULL,
+			output_tokens INTEGER NOT NULL,
+			total_tokens INTEGER NOT NULL,
+			cached_tokens INTEGER NOT NULL,
+			reasoning_tokens INTEGER NOT NULL,
+			estimated_cost_usd REAL NOT NULL
+		);
+		INSERT INTO request_logs VALUES
+			(?, 'account-a', 'alice@example.com', 'gpt-5.5', 1, 10, 5, 15, 3, 1, 1),
+			(?, 'account-b', 'bob@example.com', 'gpt-5.5', 1, 20, 8, 28, 4, 2, 3);
+	`, since+1000, since+2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	usage := loadUsage(dir)
+	model := findModel(t, usage.Models, "gpt-5.5")
+	if len(model.Accounts) != 2 {
+		t.Fatalf("account breakdown len = %d, want 2", len(model.Accounts))
+	}
+	var accountCost float64
+	for _, account := range model.Accounts {
+		accountCost += account.Usage.EstimatedCostUSD
+	}
+	if math.Abs(accountCost-model.Usage.EstimatedCostUSD) > 1e-9 {
+		t.Fatalf("account cost sum = %f, model cost = %f", accountCost, model.Usage.EstimatedCostUSD)
+	}
+	if usage.SinceLabel != formatTime(since) || usage.UpdatedLabel != formatTime(1_700_000_300_000) {
+		t.Fatalf("millisecond labels not normalized: %+v", usage)
 	}
 }
 
@@ -613,7 +834,7 @@ func TestStaleNotifierSendsWebhookWhenAccountStopsRefreshing(t *testing.T) {
 	stateDir := t.TempDir()
 	now := time.Unix(1_780_000_000, 0)
 	usageUpdatedAt := now.Add(-31 * time.Minute).Unix()
-	hourlyResetAt := usageUpdatedAt + int64(5 * time.Hour / time.Second)
+	hourlyResetAt := usageUpdatedAt + int64(5*time.Hour/time.Second)
 	weeklyResetAt := now.Add(24 * time.Hour).Unix()
 	writeTestAccountWithUsageUpdatedAt(t, dir, "account-a", "alice@example.com", 21, weeklyResetAt, usageUpdatedAt)
 
@@ -851,6 +1072,13 @@ func TestUsageDisplayHelpers(t *testing.T) {
 	}
 }
 
+func TestFormatTimeAcceptsSecondsAndMilliseconds(t *testing.T) {
+	const seconds = int64(1_784_377_842)
+	if got, want := formatTime(seconds*1000), formatTime(seconds); got != want {
+		t.Fatalf("millisecond label = %q, second label = %q", got, want)
+	}
+}
+
 func TestDashboardTemplateRendersNewLayout(t *testing.T) {
 	tmpl := template.Must(template.New("dashboard").Funcs(dashboardFuncs()).Parse(dashboardHTML))
 	summary := summaryView{
@@ -920,7 +1148,7 @@ func writeTestAccountWithUsageUpdatedAt(t *testing.T, dir, id, email string, wee
 	if err := os.MkdirAll(accountsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	hourlyResetAt := usageUpdatedAt + int64(5 * time.Hour / time.Second)
+	hourlyResetAt := usageUpdatedAt + int64(5*time.Hour/time.Second)
 	content := `{
 		"email": "` + email + `",
 		"auth_mode": "oauth",
@@ -948,7 +1176,7 @@ func writeTestAccountWithoutWeeklyWindow(t *testing.T, dir, id, email string, us
 	if err := os.MkdirAll(accountsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	hourlyResetAt := usageUpdatedAt + int64(5 * time.Hour / time.Second)
+	hourlyResetAt := usageUpdatedAt + int64(5*time.Hour/time.Second)
 	content := `{
 		"email": "` + email + `",
 		"auth_mode": "oauth",
