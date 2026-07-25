@@ -18,6 +18,34 @@ steps:
       NEXUS_PASSWORD:
         from_secret: nexus_password
 
+  - name: deploy
+    image: bitnami/kubectl:latest
+    commands:
+      - mkdir -p ~/.kube
+      - 'echo "$${K8S_KUBECONFIG}" > ~/.kube/config'
+      - chmod 600 ~/.kube/config
+      - kubectl apply -f k8s/deployment.yaml
+      - kubectl apply -f k8s/service.yaml
+      - |
+        set -eu
+        namespace=project-cockpit
+        image="docker.nexus.ixuni.win/codex-quota-viewer:v${CI_PIPELINE_NUMBER}"
+        kubectl set image deployment/codex-quota-viewer-osk codex-quota-viewer="$${image}" -n "$${namespace}"
+        kubectl set image deployment/codex-quota-viewer-ash codex-quota-viewer="$${image}" -n "$${namespace}"
+        if ! kubectl rollout status deployment/codex-quota-viewer-osk -n "$${namespace}" --timeout=10m || \
+           ! kubectl rollout status deployment/codex-quota-viewer-ash -n "$${namespace}" --timeout=10m; then
+          kubectl rollout undo deployment/codex-quota-viewer-osk -n "$${namespace}" || true
+          kubectl rollout undo deployment/codex-quota-viewer-ash -n "$${namespace}" || true
+          kubectl rollout status deployment/codex-quota-viewer-osk -n "$${namespace}" --timeout=10m || true
+          kubectl rollout status deployment/codex-quota-viewer-ash -n "$${namespace}" --timeout=10m || true
+          exit 1
+        fi
+        kubectl get deployment/codex-quota-viewer-osk deployment/codex-quota-viewer-ash -n "$${namespace}" \
+          -o custom-columns='NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image,READY:.status.readyReplicas'
+    environment:
+      K8S_KUBECONFIG:
+        from_secret: k8s_kubeconfig
+
   - name: notify-success
     image: docker.nexus.ixuni.win/woodpecker-mlntfy:latest
     pull: true

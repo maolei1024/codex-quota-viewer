@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: codex-quota-viewer-osk
+  namespace: project-cockpit
+  labels:
+    app.kubernetes.io/name: codex-quota-viewer
+    app.kubernetes.io/instance: osk
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: codex-quota-viewer
+    app.kubernetes.io/instance: osk
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codex-quota-viewer-ash
+  namespace: project-cockpit
+  labels:
+    app.kubernetes.io/name: codex-quota-viewer
+    app.kubernetes.io/instance: ash
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: codex-quota-viewer
+    app.kubernetes.io/instance: ash
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

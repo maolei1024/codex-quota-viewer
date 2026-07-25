@@ -149,3 +149,19 @@ Environment variables:
 go test ./...
 docker build -t codex-quota-viewer:local .
 ```
+
+## Kubernetes CD
+
+The Woodpecker deploy pipeline publishes an immutable multi-architecture image tagged with `v${CI_PIPELINE_NUMBER}`, applies the resources in `k8s/`, and updates both quota-viewer Deployments in the `project-cockpit` namespace:
+
+- `codex-quota-viewer-osk` is pinned to `oracle-osk`.
+- `codex-quota-viewer-ash` is pinned to `oracle-ash`.
+
+Each viewer shares its node's Cockpit Longhorn PVC. `/data` is mounted read-only, while `/state` remains writable for notification deduplication. The pipeline requires the Woodpecker secret `k8s_kubeconfig`.
+
+```bash
+kubectl rollout status deployment/codex-quota-viewer-osk -n project-cockpit
+kubectl rollout status deployment/codex-quota-viewer-ash -n project-cockpit
+kubectl rollout undo deployment/codex-quota-viewer-osk -n project-cockpit
+kubectl rollout undo deployment/codex-quota-viewer-ash -n project-cockpit
+```
