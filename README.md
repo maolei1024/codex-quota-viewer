@@ -7,7 +7,8 @@ the mounted Cockpit data directory, masks account identities, and renders a
 human-oriented dashboard.
 
 When configured, it can also send webhook notifications when a Codex account's
-weekly quota window resets or its quota cache becomes stale.
+weekly quota first reaches 3% or less in a quota cycle, its weekly quota window
+resets, or its quota cache becomes stale.
 
 ## Data Sources
 
@@ -48,13 +49,16 @@ Cockpit Tools is not running, this viewer shows the last cached quota.
 
 ## Notifications
 
-The viewer can send webhooks for two quota events.
+The viewer can send webhooks for three quota events.
 
 - Weekly reset: sent when an account's weekly quota reset time is reached, or
   when the cached weekly reset time jumps forward by at least five minutes
   before the previous reset time was reached. The second case catches the first
   early quota reset signal while ignoring small timestamp drift in cached quota
   data.
+- Low weekly quota: sent the first time an account's weekly remaining quota is
+  observed at 3% or less in each weekly quota cycle. It is deduplicated per
+  account and cycle, including across restarts and small reset-time drift.
 - Stale cache: sent when an account's quota cache becomes stale according to
   `STALE_AFTER_MINUTES`. It is deduplicated by account and `usage_updated_at`,
   so the same stale cache value only sends once. If the account refreshes later
@@ -79,6 +83,14 @@ Weekly reset JSON uses:
 - `tags`: `codex,quota,weekly-reset`
 - `message`: masked account, weekly remaining percentage, observed reset time,
   and current next reset time
+
+Low weekly quota JSON uses:
+
+- `title`: `Codex 周额度已达 3% 以下`
+- `priority`: `high`
+- `tags`: `codex,quota,weekly-low`
+- `message`: masked account, weekly remaining percentage, notification
+  threshold, and the current cycle reset time
 
 Stale cache JSON uses:
 
@@ -131,7 +143,7 @@ Environment variables:
 | `DATA_DIR` | `/data` | Mounted Cockpit Tools data directory |
 | `STALE_AFTER_MINUTES` | `30` | Mark quota cache as stale after this many minutes |
 | `REFRESH_INTERVAL_SECONDS` | `300` | Dashboard refresh and notification check interval |
-| `WEEKLY_RESET_NOTIFY_URL` | empty | Webhook URL. Leave empty to disable notifications |
+| `WEEKLY_RESET_NOTIFY_URL` | empty | Webhook URL for quota notifications. Leave empty to disable notifications |
 | `WEEKLY_RESET_NOTIFY_STATE_DIR` | `/state` | Writable directory for notification dedupe state |
 | `WEEKLY_RESET_NOTIFY_TIMEOUT_SECONDS` | `10` | Webhook request timeout |
 

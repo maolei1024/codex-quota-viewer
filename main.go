@@ -26,17 +26,18 @@ import (
 )
 
 const (
-	defaultListenAddr      = ":8080"
-	defaultDataDir         = "/data"
-	defaultStaleAfter      = 30 * time.Minute
-	defaultRefreshInterval = 5 * time.Minute
-	defaultNotifyStateDir  = "/state"
-	defaultNotifyTimeout   = 10 * time.Second
-	minWeeklyResetJump     = 5 * time.Minute
-	secureAccountKeyFile   = "secure-account-storage.key"
-	secureAccountVersion   = 1
-	unixMillisThreshold    = int64(100_000_000_000)
-	weeklyWindowMinutes    = int64(7 * 24 * 60)
+	defaultListenAddr       = ":8080"
+	defaultDataDir          = "/data"
+	defaultStaleAfter       = 30 * time.Minute
+	defaultRefreshInterval  = 5 * time.Minute
+	defaultNotifyStateDir   = "/state"
+	defaultNotifyTimeout    = 10 * time.Second
+	minWeeklyResetJump      = 5 * time.Minute
+	lowWeeklyQuotaThreshold = 3
+	secureAccountKeyFile    = "secure-account-storage.key"
+	secureAccountVersion    = 1
+	unixMillisThreshold     = int64(100_000_000_000)
+	weeklyWindowMinutes     = int64(7 * 24 * 60)
 )
 
 type config struct {
@@ -198,13 +199,15 @@ type weeklyResetReminderState struct {
 }
 
 type weeklyResetAccountState struct {
-	Account                     string `json:"account,omitempty"`
-	ObservedResetAt             int64  `json:"observedResetAt,omitempty"`
-	NotifiedResetAt             int64  `json:"notifiedResetAt,omitempty"`
-	NotifiedStaleUsageUpdatedAt int64  `json:"notifiedStaleUsageUpdatedAt,omitempty"`
-	NotifiedStaleAt             int64  `json:"notifiedStaleAt,omitempty"`
-	SuppressFutureJumpsUntil    int64  `json:"suppressFutureJumpsUntil,omitempty"`
-	UpdatedAt                   int64  `json:"updatedAt,omitempty"`
+	Account                       string `json:"account,omitempty"`
+	ObservedResetAt               int64  `json:"observedResetAt,omitempty"`
+	NotifiedResetAt               int64  `json:"notifiedResetAt,omitempty"`
+	NotifiedLowWeeklyCycleResetAt int64  `json:"notifiedLowWeeklyCycleResetAt,omitempty"`
+	NotifiedLowWeeklyAt           int64  `json:"notifiedLowWeeklyAt,omitempty"`
+	NotifiedStaleUsageUpdatedAt   int64  `json:"notifiedStaleUsageUpdatedAt,omitempty"`
+	NotifiedStaleAt               int64  `json:"notifiedStaleAt,omitempty"`
+	SuppressFutureJumpsUntil      int64  `json:"suppressFutureJumpsUntil,omitempty"`
+	UpdatedAt                     int64  `json:"updatedAt,omitempty"`
 }
 
 type simpleNotificationPayload struct {
@@ -657,19 +660,38 @@ func checkWeeklyResetNotifications(cfg config, now time.Time, client *http.Clien
 		rolledForward := previousObservedResetAt > 0 && resetJump >= minWeeklyResetJump && !futureJumpSuppressed
 		reachedObservedReset := observedResetAt <= nowUnix
 		needsNotification := accountState.NotifiedResetAt != observedResetAt && (reachedObservedReset || rolledForward)
+		if rolledForward && accountState.NotifiedLowWeeklyCycleResetAt <= previousObservedResetAt {
+			accountState.NotifiedLowWeeklyCycleResetAt = 0
+			accountState.NotifiedLowWeeklyAt = 0
+		}
 
+		weeklyResetNotificationFailed := false
 		if needsNotification {
 			if err := sendWeeklyResetNotification(client, cfg.WeeklyResetNotifyURL, account, observedResetAt, currentResetAt); err != nil {
 				if firstErr == nil {
 					firstErr = err
 				}
-				state.Accounts[accountKey] = accountState
-				continue
+				weeklyResetNotificationFailed = true
+			} else {
+				accountState.NotifiedResetAt = observedResetAt
+				if currentResetAt > observedResetAt {
+					accountState.SuppressFutureJumpsUntil = currentResetAt
+				}
 			}
-			accountState.NotifiedResetAt = observedResetAt
-			if currentResetAt > observedResetAt {
-				accountState.SuppressFutureJumpsUntil = currentResetAt
+		}
+		if account.Weekly.Remaining <= lowWeeklyQuotaThreshold && accountState.NotifiedLowWeeklyCycleResetAt <= 0 {
+			if err := sendLowWeeklyQuotaNotification(client, cfg.WeeklyResetNotifyURL, account); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				accountState.NotifiedLowWeeklyCycleResetAt = currentResetAt
+				accountState.NotifiedLowWeeklyAt = nowUnix
 			}
+		}
+		if weeklyResetNotificationFailed {
+			state.Accounts[accountKey] = accountState
+			continue
 		}
 		if currentResetAt > accountState.ObservedResetAt {
 			accountState.ObservedResetAt = currentResetAt
@@ -754,6 +776,22 @@ func sendWeeklyResetNotification(client *http.Client, url string, account accoun
 		}, "\n"),
 	}
 	return sendSimpleNotification(client, url, payload, "weekly reset notification")
+}
+
+func sendLowWeeklyQuotaNotification(client *http.Client, url string, account accountView) error {
+	payload := simpleNotificationPayload{
+		Title:    "Codex 周额度已达 3% 以下",
+		Priority: "high",
+		Tags:     "codex,quota,weekly-low",
+		Message: strings.Join([]string{
+			"Codex 周额度已达 3% 以下",
+			"账号: " + account.Email,
+			fmt.Sprintf("周剩余: %d%%", account.Weekly.Remaining),
+			fmt.Sprintf("通知阈值: %d%%", lowWeeklyQuotaThreshold),
+			"本周期重置: " + formatOptionalTime(account.Weekly.ResetAt),
+		}, "\n"),
+	}
+	return sendSimpleNotification(client, url, payload, "low weekly quota notification")
 }
 
 func sendStaleNotification(client *http.Client, url string, account accountView, staleAfter time.Duration) error {

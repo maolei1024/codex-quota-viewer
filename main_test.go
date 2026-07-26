@@ -829,6 +829,189 @@ func TestWeeklyResetNotifierIgnoresTinyFutureResetDrift(t *testing.T) {
 	}
 }
 
+func TestLowWeeklyNotifierSendsAtThresholdOnlyOncePerCycle(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := t.TempDir()
+	now := time.Unix(1_780_000_000, 0)
+	resetAt := now.Add(24 * time.Hour).Unix()
+	writeTestAccountWithUsageUpdatedAt(t, dir, "account-a", "alice@example.com", lowWeeklyQuotaThreshold, resetAt, now.Unix())
+
+	var payloads []map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		payloads = append(payloads, payload)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+	}))
+	defer server.Close()
+
+	cfg := config{
+		DataDir:                   dir,
+		StaleAfter:                30 * time.Minute,
+		WeeklyResetNotifyURL:      server.URL + "/api/notifications/simple/send/mlNtfy",
+		WeeklyResetNotifyStateDir: stateDir,
+		WeeklyResetNotifyTimeout:  time.Second,
+	}
+	if err := checkWeeklyResetNotifications(cfg, now, server.Client()); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkWeeklyResetNotifications(cfg, now.Add(time.Minute), server.Client()); err != nil {
+		t.Fatal(err)
+	}
+	if len(payloads) != 1 {
+		t.Fatalf("notifications = %d, want 1", len(payloads))
+	}
+	payload := payloads[0]
+	if payload["title"] != "Codex 周额度已达 3% 以下" {
+		t.Fatalf("title = %q", payload["title"])
+	}
+	if payload["priority"] != "high" || payload["tags"] != "codex,quota,weekly-low" {
+		t.Fatalf("unexpected payload: %+v", payload)
+	}
+	for _, want := range []string{"a***@**.com", "周剩余: 3%", "通知阈值: 3%", formatTime(resetAt)} {
+		if !strings.Contains(payload["message"], want) {
+			t.Fatalf("message missing %q: %q", want, payload["message"])
+		}
+	}
+
+	state, err := loadWeeklyResetReminderState(filepath.Join(stateDir, weeklyResetReminderStateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountState := state.Accounts["account-a"]
+	if accountState.NotifiedLowWeeklyCycleResetAt != resetAt {
+		t.Fatalf("notified low weekly cycle reset = %d, want %d", accountState.NotifiedLowWeeklyCycleResetAt, resetAt)
+	}
+	if accountState.NotifiedLowWeeklyAt != now.Unix() {
+		t.Fatalf("notified low weekly at = %d, want %d", accountState.NotifiedLowWeeklyAt, now.Unix())
+	}
+}
+
+func TestLowWeeklyNotifierDoesNotSendAboveThreshold(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := t.TempDir()
+	now := time.Unix(1_780_000_000, 0)
+	resetAt := now.Add(24 * time.Hour).Unix()
+	writeTestAccountWithUsageUpdatedAt(t, dir, "account-a", "alice@example.com", lowWeeklyQuotaThreshold+1, resetAt, now.Unix())
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+	}))
+	defer server.Close()
+
+	cfg := config{
+		DataDir:                   dir,
+		StaleAfter:                30 * time.Minute,
+		WeeklyResetNotifyURL:      server.URL + "/api/notifications/simple/send/mlNtfy",
+		WeeklyResetNotifyStateDir: stateDir,
+		WeeklyResetNotifyTimeout:  time.Second,
+	}
+	if err := checkWeeklyResetNotifications(cfg, now, server.Client()); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want 0", requests)
+	}
+}
+
+func TestLowWeeklyNotifierSendsAgainAfterWeeklyCycleRollsForward(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := t.TempDir()
+	now := time.Unix(1_780_000_000, 0)
+	previousResetAt := now.Add(-time.Minute).Unix()
+	currentResetAt := now.Add(7 * 24 * time.Hour).Unix()
+	writeTestAccountWithUsageUpdatedAt(t, dir, "account-a", "alice@example.com", 2, currentResetAt, now.Unix())
+	if err := saveWeeklyResetReminderState(filepath.Join(stateDir, weeklyResetReminderStateFile), weeklyResetReminderState{
+		Accounts: map[string]weeklyResetAccountState{
+			"account-a": {
+				ObservedResetAt:               previousResetAt,
+				NotifiedResetAt:               previousResetAt,
+				NotifiedLowWeeklyCycleResetAt: previousResetAt,
+				NotifiedLowWeeklyAt:           now.Add(-time.Hour).Unix(),
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotPayload map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+	}))
+	defer server.Close()
+
+	cfg := config{
+		DataDir:                   dir,
+		StaleAfter:                30 * time.Minute,
+		WeeklyResetNotifyURL:      server.URL + "/api/notifications/simple/send/mlNtfy",
+		WeeklyResetNotifyStateDir: stateDir,
+		WeeklyResetNotifyTimeout:  time.Second,
+	}
+	if err := checkWeeklyResetNotifications(cfg, now, server.Client()); err != nil {
+		t.Fatal(err)
+	}
+	if gotPayload["tags"] != "codex,quota,weekly-low" {
+		t.Fatalf("unexpected payload: %+v", gotPayload)
+	}
+
+	state, err := loadWeeklyResetReminderState(filepath.Join(stateDir, weeklyResetReminderStateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountState := state.Accounts["account-a"]
+	if accountState.NotifiedLowWeeklyCycleResetAt != currentResetAt {
+		t.Fatalf("notified low weekly cycle reset = %d, want %d", accountState.NotifiedLowWeeklyCycleResetAt, currentResetAt)
+	}
+}
+
+func TestLowWeeklyNotifierIgnoresResetTimeDriftWithinCycle(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := t.TempDir()
+	now := time.Unix(1_780_000_000, 0)
+	observedResetAt := now.Add(7 * 24 * time.Hour).Unix()
+	currentResetAt := observedResetAt + 1
+	writeTestAccountWithUsageUpdatedAt(t, dir, "account-a", "alice@example.com", 2, currentResetAt, now.Unix())
+	if err := saveWeeklyResetReminderState(filepath.Join(stateDir, weeklyResetReminderStateFile), weeklyResetReminderState{
+		Accounts: map[string]weeklyResetAccountState{
+			"account-a": {
+				ObservedResetAt:               observedResetAt,
+				NotifiedLowWeeklyCycleResetAt: observedResetAt,
+				NotifiedLowWeeklyAt:           now.Add(-time.Hour).Unix(),
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+	}))
+	defer server.Close()
+
+	cfg := config{
+		DataDir:                   dir,
+		StaleAfter:                30 * time.Minute,
+		WeeklyResetNotifyURL:      server.URL + "/api/notifications/simple/send/mlNtfy",
+		WeeklyResetNotifyStateDir: stateDir,
+		WeeklyResetNotifyTimeout:  time.Second,
+	}
+	if err := checkWeeklyResetNotifications(cfg, now, server.Client()); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want 0", requests)
+	}
+}
+
 func TestStaleNotifierSendsWebhookWhenAccountStopsRefreshing(t *testing.T) {
 	dir := t.TempDir()
 	stateDir := t.TempDir()
