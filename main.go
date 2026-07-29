@@ -999,7 +999,7 @@ func queryUsageTotals(ctx context.Context, db *sql.DB, since int64) usageTotals 
 		&totals.ReasoningTokens,
 		&totals.EstimatedCostUSD,
 	); err != nil {
-		log.Printf("query usage totals: %v", err)
+		logSQLiteQueryError("query usage totals", err)
 	}
 	return totals
 }
@@ -1024,10 +1024,9 @@ func queryModelUsage(ctx context.Context, db *sql.DB, since int64) []modelUsage 
 		ORDER BY COUNT(*) DESC
 		LIMIT 12`, since)
 	if err != nil {
-		log.Printf("query model usage: %v", err)
+		logSQLiteQueryError("query model usage", err)
 		return nil
 	}
-	defer rows.Close()
 
 	var models []modelUsage
 	for rows.Next() {
@@ -1044,13 +1043,24 @@ func queryModelUsage(ctx context.Context, db *sql.DB, since int64) []modelUsage 
 			&model.Usage.ReasoningTokens,
 			&model.Usage.EstimatedCostUSD,
 		); err != nil {
-			log.Printf("scan model usage: %v", err)
+			logSQLiteQueryError("scan model usage", err)
 			continue
 		}
-		if includeAccounts {
-			model.Accounts = queryModelAccountUsage(ctx, db, since, model.ModelID)
-		}
 		models = append(models, model)
+	}
+	if err := rows.Err(); err != nil {
+		logSQLiteQueryError("iterate model usage", err)
+	}
+	if err := rows.Close(); err != nil {
+		logSQLiteQueryError("close model usage rows", err)
+	}
+	if includeAccounts {
+		for i := range models {
+			if ctx.Err() != nil {
+				return models
+			}
+			models[i].Accounts = queryModelAccountUsage(ctx, db, since, models[i].ModelID)
+		}
 	}
 	return models
 }
@@ -1132,8 +1142,7 @@ func maxInt64(left, right int64) int64 {
 	return right
 }
 
-func queryModelAccountUsage(ctx context.Context, db *sql.DB, since int64, modelID string) []accountUsage {
-	rows, err := db.QueryContext(ctx, `
+const modelAccountUsageQuery = `
 		SELECT
 			COALESCE(MAX(NULLIF(email, '')), MAX(NULLIF(account_id, '')), 'unknown') AS account,
 			COUNT(*),
@@ -1146,13 +1155,39 @@ func queryModelAccountUsage(ctx context.Context, db *sql.DB, since int64, modelI
 			COALESCE(SUM(reasoning_tokens), 0),
 			COALESCE(SUM(estimated_cost_usd), 0)
 		FROM request_logs
-		WHERE timestamp >= ?
-			AND COALESCE(NULLIF(model_id, ''), 'unknown') = ?
+		WHERE model_id = ? AND timestamp >= ?
 		GROUP BY COALESCE(NULLIF(account_id, ''), NULLIF(email, ''), 'unknown')
 		ORDER BY COUNT(*) DESC, COALESCE(SUM(estimated_cost_usd), 0) DESC
-		LIMIT 12`, since, modelID)
+		LIMIT 12`
+
+const unknownModelAccountUsageQuery = `
+		SELECT
+			COALESCE(MAX(NULLIF(email, '')), MAX(NULLIF(account_id, '')), 'unknown') AS account,
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(input_tokens), 0),
+			COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(total_tokens), 0),
+			COALESCE(SUM(cached_tokens), 0),
+			COALESCE(SUM(reasoning_tokens), 0),
+			COALESCE(SUM(estimated_cost_usd), 0)
+		FROM request_logs
+		WHERE (model_id = '' OR model_id IS NULL) AND timestamp >= ?
+		GROUP BY COALESCE(NULLIF(account_id, ''), NULLIF(email, ''), 'unknown')
+		ORDER BY COUNT(*) DESC, COALESCE(SUM(estimated_cost_usd), 0) DESC
+		LIMIT 12`
+
+func queryModelAccountUsage(ctx context.Context, db *sql.DB, since int64, modelID string) []accountUsage {
+	query := modelAccountUsageQuery
+	args := []any{modelID, since}
+	if modelID == "unknown" {
+		query = unknownModelAccountUsageQuery
+		args = []any{since}
+	}
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
-		log.Printf("query model account usage: %v", err)
+		logSQLiteQueryError("query model account usage", err)
 		return nil
 	}
 	defer rows.Close()
@@ -1173,12 +1208,25 @@ func queryModelAccountUsage(ctx context.Context, db *sql.DB, since int64, modelI
 			&usage.ReasoningTokens,
 			&usage.EstimatedCostUSD,
 		); err != nil {
-			log.Printf("scan model account usage: %v", err)
+			logSQLiteQueryError("scan model account usage", err)
 			continue
 		}
-		accounts = append(accounts, accountUsage{Account: maskUsageAccount(account), Usage: usage})
+		accounts = append(accounts, accountUsage{
+			Account: maskUsageAccount(account),
+			Usage:   usage,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		logSQLiteQueryError("iterate model account usage", err)
 	}
 	return accounts
+}
+
+func logSQLiteQueryError(label string, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	log.Printf("%s: %v", label, err)
 }
 
 func requestLogsHaveColumns(ctx context.Context, db *sql.DB, columns ...string) bool {
@@ -1187,7 +1235,7 @@ func requestLogsHaveColumns(ctx context.Context, db *sql.DB, columns ...string) 
 	}
 	rows, err := db.QueryContext(ctx, "PRAGMA table_info(request_logs)")
 	if err != nil {
-		log.Printf("inspect request_logs columns: %v", err)
+		logSQLiteQueryError("inspect request_logs columns", err)
 		return false
 	}
 	defer rows.Close()
@@ -1200,7 +1248,7 @@ func requestLogsHaveColumns(ctx context.Context, db *sql.DB, columns ...string) 
 		var defaultValue any
 		var pk int
 		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
-			log.Printf("scan request_logs column: %v", err)
+			logSQLiteQueryError("scan request_logs column", err)
 			return false
 		}
 		available[name] = true
@@ -1244,7 +1292,7 @@ func normalizeSQLiteTimestamp(ctx context.Context, db *sql.DB, value int64) int6
 func sqliteUsesMilliseconds(ctx context.Context, db *sql.DB) bool {
 	var latest sql.NullInt64
 	if err := db.QueryRowContext(ctx, "SELECT MAX(timestamp) FROM request_logs").Scan(&latest); err != nil {
-		log.Printf("inspect request_logs timestamp unit: %v", err)
+		logSQLiteQueryError("inspect request_logs timestamp unit", err)
 		return false
 	}
 	return latest.Valid && isUnixMilliseconds(latest.Int64)

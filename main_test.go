@@ -394,8 +394,9 @@ func TestLoadUsageFromSQLiteIncludesModelAccountBreakdown(t *testing.T) {
 			(?, 'account-a', 'alice@example.com', 'gpt-5.5', 1, 10, 5, 15, 3, 1, 1.25),
 			(?, 'account-b', 'bob@example.com', 'gpt-5.5', 1, 20, 8, 28, 4, 2, 2.50),
 			(?, 'account-b', 'bob@example.com', 'gpt-5.5', 0, 1, 0, 1, 0, 0, 0.50),
-			(?, 'account-a', 'alice@example.com', 'gpt-5-codex', 1, 4, 2, 6, 1, 0, 0.25);
-	`, time.Now().Unix(), time.Now().Unix(), time.Now().Unix(), time.Now().Unix())
+			(?, 'account-a', 'alice@example.com', 'gpt-5-codex', 1, 4, 2, 6, 1, 0, 0.25),
+			(?, '', '', '', 1, 1, 1, 2, 0, 0, 0.10);
+	`, time.Now().Unix(), time.Now().Unix(), time.Now().Unix(), time.Now().Unix(), time.Now().Unix())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,6 +417,59 @@ func TestLoadUsageFromSQLiteIncludesModelAccountBreakdown(t *testing.T) {
 	}
 	if model.Accounts[1].Account != "a***@**.com" || model.Accounts[1].Usage.RequestCount != 1 {
 		t.Fatalf("second account = %+v", model.Accounts[1])
+	}
+	unknown := findModel(t, usage.Models, "unknown")
+	if len(unknown.Accounts) != 1 || unknown.Accounts[0].Account != "unknown" {
+		t.Fatalf("unknown account breakdown = %+v", unknown.Accounts)
+	}
+}
+
+func TestModelAccountUsageQueryUsesCompositeIndex(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "usage.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`
+		CREATE TABLE request_logs (
+			timestamp INTEGER NOT NULL,
+			account_id TEXT NOT NULL DEFAULT '',
+			email TEXT NOT NULL DEFAULT '',
+			model_id TEXT NOT NULL DEFAULT '',
+			success INTEGER NOT NULL DEFAULT 0,
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
+			cached_tokens INTEGER NOT NULL DEFAULT 0,
+			reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+			estimated_cost_usd REAL NOT NULL DEFAULT 0
+		);
+		CREATE INDEX idx_codex_local_access_logs_model
+			ON request_logs(model_id, timestamp DESC);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query("EXPLAIN QUERY PLAN "+modelAccountUsageQuery, "gpt-5.5", time.Now().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	usesModelIndex := false
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(detail, "idx_codex_local_access_logs_model") {
+			usesModelIndex = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !usesModelIndex {
+		t.Fatal("model account query does not use idx_codex_local_access_logs_model")
 	}
 }
 
