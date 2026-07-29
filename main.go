@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"database/sql"
@@ -224,7 +225,7 @@ type simpleNotificationResponse struct {
 
 func main() {
 	cfg := loadConfig()
-	app := &server{cfg: cfg, tmpl: template.Must(template.New("dashboard").Funcs(dashboardFuncs()).Parse(dashboardHTML))}
+	app := newServer(cfg)
 	app.startBackgroundTasks()
 
 	mux := http.NewServeMux()
@@ -255,8 +256,17 @@ func dashboardFuncs() template.FuncMap {
 }
 
 type server struct {
-	cfg  config
-	tmpl *template.Template
+	cfg            config
+	tmpl           *template.Template
+	usageQueryGate chan struct{}
+}
+
+func newServer(cfg config) *server {
+	return &server{
+		cfg:            cfg,
+		tmpl:           template.Must(template.New("dashboard").Funcs(dashboardFuncs()).Parse(dashboardHTML)),
+		usageQueryGate: make(chan struct{}, 1),
+	}
 }
 
 func (s *server) startBackgroundTasks() {
@@ -341,7 +351,10 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	data := s.buildSummary()
+	data := s.buildSummary(r.Context())
+	if r.Context().Err() != nil {
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.tmpl.Execute(w, data); err != nil {
 		log.Printf("render dashboard: %v", err)
@@ -349,7 +362,11 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleSummary(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, s.buildSummary())
+	summary := s.buildSummary(r.Context())
+	if r.Context().Err() != nil {
+		return
+	}
+	writeJSON(w, summary)
 }
 
 func (s *server) handleAccounts(w http.ResponseWriter, r *http.Request) {
@@ -362,7 +379,11 @@ func (s *server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleUsage(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, loadUsage(s.cfg.DataDir))
+	usage := s.loadUsage(r.Context())
+	if r.Context().Err() != nil {
+		return
+	}
+	writeJSON(w, usage)
 }
 
 func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -370,7 +391,7 @@ func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))
 }
 
-func (s *server) buildSummary() summaryView {
+func (s *server) buildSummary(ctx context.Context) summaryView {
 	now := time.Now()
 	accounts, err := loadAccounts(s.cfg)
 	if err != nil {
@@ -381,7 +402,7 @@ func (s *server) buildSummary() summaryView {
 			Error:             err.Error(),
 		}}
 	}
-	usage := loadUsage(s.cfg.DataDir)
+	usage := s.loadUsage(ctx)
 	summary := summaryView{
 		GeneratedAt:      now.Unix(),
 		GeneratedLabel:   formatTime(now.Unix()),
@@ -417,6 +438,19 @@ func (s *server) buildSummary() summaryView {
 		}
 	}
 	return summary
+}
+
+func (s *server) loadUsage(ctx context.Context) usageView {
+	if s.usageQueryGate == nil {
+		return loadUsageContext(ctx, s.cfg.DataDir)
+	}
+	select {
+	case s.usageQueryGate <- struct{}{}:
+		defer func() { <-s.usageQueryGate }()
+	case <-ctx.Done():
+		return usageView{Available: false, Source: "sqlite", Error: "request canceled"}
+	}
+	return loadUsageContext(ctx, s.cfg.DataDir)
 }
 
 func loadAccounts(cfg config) ([]accountView, error) {
@@ -856,15 +890,19 @@ func sendSimpleNotification(client *http.Client, url string, payload simpleNotif
 }
 
 func loadUsage(dataDir string) usageView {
+	return loadUsageContext(context.Background(), dataDir)
+}
+
+func loadUsageContext(ctx context.Context, dataDir string) usageView {
 	statsPath := filepath.Join(dataDir, "codex_local_access_stats.json")
 	if usage, ok := loadUsageFromStatsFile(statsPath); ok {
 		if usage.Available {
 			sqlitePath := filepath.Join(dataDir, "codex_local_access_logs.sqlite")
-			usage.Models = attachModelAccountUsageFromSQLite(sqlitePath, usage.BreakdownSince, usage.Models)
+			usage.Models = attachModelAccountUsageFromSQLite(ctx, sqlitePath, usage.BreakdownSince, usage.Models)
 		}
 		return usage
 	}
-	return loadUsageFromSQLite(filepath.Join(dataDir, "codex_local_access_logs.sqlite"))
+	return loadUsageFromSQLiteContext(ctx, filepath.Join(dataDir, "codex_local_access_logs.sqlite"))
 }
 
 func loadUsageFromStatsFile(path string) (usageView, bool) {
@@ -901,6 +939,10 @@ func loadUsageFromStatsFile(path string) (usageView, bool) {
 }
 
 func loadUsageFromSQLite(path string) usageView {
+	return loadUsageFromSQLiteContext(context.Background(), path)
+}
+
+func loadUsageFromSQLiteContext(ctx context.Context, path string) usageView {
 	if _, err := os.Stat(path); err != nil {
 		return usageView{Available: false, Source: "sqlite", Error: "no local access usage data"}
 	}
@@ -911,13 +953,13 @@ func loadUsageFromSQLite(path string) usageView {
 	defer db.Close()
 
 	now := time.Now()
-	dailySince := sqliteTimestamp(db, now.Add(-24*time.Hour))
-	weeklySince := sqliteTimestamp(db, now.Add(-7*24*time.Hour))
-	monthlySince := sqliteTimestamp(db, now.Add(-30*24*time.Hour))
-	daily := queryUsageTotals(db, dailySince)
-	weekly := queryUsageTotals(db, weeklySince)
-	monthly := queryUsageTotals(db, monthlySince)
-	models := queryModelUsage(db, monthlySince)
+	dailySince := sqliteTimestamp(ctx, db, now.Add(-24*time.Hour))
+	weeklySince := sqliteTimestamp(ctx, db, now.Add(-7*24*time.Hour))
+	monthlySince := sqliteTimestamp(ctx, db, now.Add(-30*24*time.Hour))
+	daily := queryUsageTotals(ctx, db, dailySince)
+	weekly := queryUsageTotals(ctx, db, weeklySince)
+	monthly := queryUsageTotals(ctx, db, monthlySince)
+	models := queryModelUsage(ctx, db, monthlySince)
 	return usageView{
 		Available:      true,
 		Source:         "sqlite",
@@ -931,9 +973,9 @@ func loadUsageFromSQLite(path string) usageView {
 	}
 }
 
-func queryUsageTotals(db *sql.DB, since int64) usageTotals {
+func queryUsageTotals(ctx context.Context, db *sql.DB, since int64) usageTotals {
 	var totals usageTotals
-	row := db.QueryRow(`
+	row := db.QueryRowContext(ctx, `
 		SELECT
 			COUNT(*),
 			COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0),
@@ -962,9 +1004,9 @@ func queryUsageTotals(db *sql.DB, since int64) usageTotals {
 	return totals
 }
 
-func queryModelUsage(db *sql.DB, since int64) []modelUsage {
-	includeAccounts := requestLogsHaveColumns(db, "account_id", "email")
-	rows, err := db.Query(`
+func queryModelUsage(ctx context.Context, db *sql.DB, since int64) []modelUsage {
+	includeAccounts := requestLogsHaveColumns(ctx, db, "account_id", "email")
+	rows, err := db.QueryContext(ctx, `
 		SELECT
 			COALESCE(NULLIF(model_id, ''), 'unknown') AS model_id,
 			COUNT(*),
@@ -1006,14 +1048,14 @@ func queryModelUsage(db *sql.DB, since int64) []modelUsage {
 			continue
 		}
 		if includeAccounts {
-			model.Accounts = queryModelAccountUsage(db, since, model.ModelID)
+			model.Accounts = queryModelAccountUsage(ctx, db, since, model.ModelID)
 		}
 		models = append(models, model)
 	}
 	return models
 }
 
-func attachModelAccountUsageFromSQLite(path string, since int64, models []modelUsage) []modelUsage {
+func attachModelAccountUsageFromSQLite(ctx context.Context, path string, since int64, models []modelUsage) []modelUsage {
 	if len(models) == 0 {
 		return models
 	}
@@ -1026,16 +1068,19 @@ func attachModelAccountUsageFromSQLite(path string, since int64, models []modelU
 		return models
 	}
 	defer db.Close()
-	if !requestLogsHaveColumns(db, "account_id", "email") {
+	if !requestLogsHaveColumns(ctx, db, "account_id", "email") {
 		return models
 	}
 	if since <= 0 {
-		since = sqliteTimestamp(db, time.Now().Add(-30*24*time.Hour))
+		since = sqliteTimestamp(ctx, db, time.Now().Add(-30*24*time.Hour))
 	} else {
-		since = normalizeSQLiteTimestamp(db, since)
+		since = normalizeSQLiteTimestamp(ctx, db, since)
 	}
 	for i := range models {
-		models[i].Accounts = queryModelAccountUsage(db, since, models[i].ModelID)
+		if ctx.Err() != nil {
+			return models
+		}
+		models[i].Accounts = queryModelAccountUsage(ctx, db, since, models[i].ModelID)
 		reconcileAccountCosts(models[i].Accounts, models[i].Usage.EstimatedCostUSD)
 	}
 	return models
@@ -1087,8 +1132,8 @@ func maxInt64(left, right int64) int64 {
 	return right
 }
 
-func queryModelAccountUsage(db *sql.DB, since int64, modelID string) []accountUsage {
-	rows, err := db.Query(`
+func queryModelAccountUsage(ctx context.Context, db *sql.DB, since int64, modelID string) []accountUsage {
+	rows, err := db.QueryContext(ctx, `
 		SELECT
 			COALESCE(MAX(NULLIF(email, '')), MAX(NULLIF(account_id, '')), 'unknown') AS account,
 			COUNT(*),
@@ -1136,11 +1181,11 @@ func queryModelAccountUsage(db *sql.DB, since int64, modelID string) []accountUs
 	return accounts
 }
 
-func requestLogsHaveColumns(db *sql.DB, columns ...string) bool {
+func requestLogsHaveColumns(ctx context.Context, db *sql.DB, columns ...string) bool {
 	if len(columns) == 0 {
 		return true
 	}
-	rows, err := db.Query("PRAGMA table_info(request_logs)")
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info(request_logs)")
 	if err != nil {
 		log.Printf("inspect request_logs columns: %v", err)
 		return false
@@ -1172,20 +1217,19 @@ func sqliteReadOnlyDSN(path string) string {
 	uri := url.URL{Scheme: "file", Path: path}
 	query := uri.Query()
 	query.Set("mode", "ro")
-	query.Set("immutable", "1")
 	uri.RawQuery = query.Encode()
 	return uri.String()
 }
 
-func sqliteTimestamp(db *sql.DB, value time.Time) int64 {
-	if sqliteUsesMilliseconds(db) {
+func sqliteTimestamp(ctx context.Context, db *sql.DB, value time.Time) int64 {
+	if sqliteUsesMilliseconds(ctx, db) {
 		return value.UnixMilli()
 	}
 	return value.Unix()
 }
 
-func normalizeSQLiteTimestamp(db *sql.DB, value int64) int64 {
-	usesMillis := sqliteUsesMilliseconds(db)
+func normalizeSQLiteTimestamp(ctx context.Context, db *sql.DB, value int64) int64 {
+	usesMillis := sqliteUsesMilliseconds(ctx, db)
 	isMillis := isUnixMilliseconds(value)
 	switch {
 	case usesMillis && !isMillis:
@@ -1197,9 +1241,9 @@ func normalizeSQLiteTimestamp(db *sql.DB, value int64) int64 {
 	}
 }
 
-func sqliteUsesMilliseconds(db *sql.DB) bool {
+func sqliteUsesMilliseconds(ctx context.Context, db *sql.DB) bool {
 	var latest sql.NullInt64
-	if err := db.QueryRow("SELECT MAX(timestamp) FROM request_logs").Scan(&latest); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT MAX(timestamp) FROM request_logs").Scan(&latest); err != nil {
 		log.Printf("inspect request_logs timestamp unit: %v", err)
 		return false
 	}
@@ -1584,17 +1628,25 @@ var dashboardHTML = `<!doctype html>
       if (!Number.isFinite(refreshSeconds) || refreshSeconds <= 0) return;
       var countdown = document.getElementById("refresh-countdown");
       var nextRefreshAt = Date.now() + refreshSeconds * 1000;
+      var refreshStarted = false;
+      var refreshTimer;
+      function refreshOnce() {
+        if (refreshStarted) return;
+        refreshStarted = true;
+        if (refreshTimer !== undefined) clearInterval(refreshTimer);
+        window.location.reload();
+      }
       function renderCountdown() {
         var remaining = Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000));
         var minutes = Math.floor(remaining / 60);
         var seconds = String(remaining % 60).padStart(2, "0");
         if (countdown) countdown.textContent = " · " + minutes + ":" + seconds;
-        if (remaining <= 0) window.location.reload();
+        if (remaining <= 0) refreshOnce();
       }
-      setInterval(renderCountdown, 1000);
+      refreshTimer = setInterval(renderCountdown, 1000);
       document.addEventListener("visibilitychange", function () {
         if (document.visibilityState === "visible" && Date.now() >= nextRefreshAt) {
-          window.location.reload();
+          refreshOnce();
         }
       });
       renderCountdown();

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"database/sql"
@@ -285,15 +286,83 @@ func TestLoadUsageFromSQLiteSupportsMillisecondTimestamps(t *testing.T) {
 	}
 }
 
-func TestSQLiteReadOnlyDSNUsesImmutableMode(t *testing.T) {
+func TestSQLiteReadOnlyDSNUsesLiveReadOnlyMode(t *testing.T) {
 	dsn := sqliteReadOnlyDSN("/data/codex_local_access_logs.sqlite")
 	if !strings.HasPrefix(dsn, "file:") {
 		t.Fatalf("dsn = %q, want file URI", dsn)
 	}
-	for _, want := range []string{"mode=ro", "immutable=1"} {
-		if !strings.Contains(dsn, want) {
-			t.Fatalf("dsn = %q, missing %q", dsn, want)
+	if !strings.Contains(dsn, "mode=ro") {
+		t.Fatalf("dsn = %q, missing mode=ro", dsn)
+	}
+	if strings.Contains(dsn, "immutable=") {
+		t.Fatalf("dsn = %q, live WAL databases must not use immutable mode", dsn)
+	}
+}
+
+func TestSQLiteReadOnlyDSNReadsLiveWALFromReadOnlyFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codex_local_access_logs.sqlite")
+	writer, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.Exec(`
+		PRAGMA journal_mode = WAL;
+		PRAGMA wal_autocheckpoint = 0;
+		CREATE TABLE request_logs (id INTEGER PRIMARY KEY);
+		INSERT INTO request_logs VALUES (1);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec("INSERT INTO request_logs VALUES (2)"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, file := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(file, 0o444); err != nil {
+			t.Fatal(err)
 		}
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(dir, 0o755)
+		for _, file := range []string{path, path + "-wal", path + "-shm"} {
+			_ = os.Chmod(file, 0o644)
+		}
+	})
+
+	reader, err := sql.Open("sqlite", sqliteReadOnlyDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	var count int
+	if err := reader.QueryRow("SELECT COUNT(*) FROM request_logs").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("row count = %d, want live WAL row count 2", count)
+	}
+}
+
+func TestServerUsageWaitStopsWhenRequestIsCanceled(t *testing.T) {
+	app := &server{
+		cfg:            config{DataDir: t.TempDir()},
+		usageQueryGate: make(chan struct{}, 1),
+	}
+	app.usageQueryGate <- struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	usage := app.loadUsage(ctx)
+	if usage.Error != "request canceled" {
+		t.Fatalf("usage error = %q, want request canceled", usage.Error)
 	}
 }
 
@@ -1299,7 +1368,16 @@ func TestDashboardTemplateRendersNewLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	html := out.String()
-	for _, want := range []string{"data-refresh-seconds=\"300\"", "模型请求排行", "gpt-5-codex", "m***@**.com", "生成 2026-06-04 13:30:00"} {
+	for _, want := range []string{
+		"data-refresh-seconds=\"300\"",
+		"模型请求排行",
+		"gpt-5-codex",
+		"m***@**.com",
+		"生成 2026-06-04 13:30:00",
+		"var refreshStarted = false",
+		"if (refreshStarted) return",
+		"clearInterval(refreshTimer)",
+	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("rendered html missing %q", want)
 		}
