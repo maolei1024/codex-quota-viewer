@@ -349,6 +349,9 @@ func TestSQLiteReadOnlyDSNReadsLiveWALFromReadOnlyFiles(t *testing.T) {
 	if count != 2 {
 		t.Fatalf("row count = %d, want live WAL row count 2", count)
 	}
+	if _, err := reader.Exec("INSERT INTO request_logs VALUES (3)"); err == nil {
+		t.Fatal("mode=ro reader unexpectedly allowed a database write")
+	}
 }
 
 func TestServerUsageWaitStopsWhenRequestIsCanceled(t *testing.T) {

@@ -105,7 +105,8 @@ spec:
             - name: config
               mountPath: /data
               subPath: .antigravity_cockpit
-              readOnly: true
+              # WAL readers update shared-memory locks even with a mode=ro database connection.
+              readOnly: false
             - name: config
               mountPath: /state
               subPath: .antigravity_cockpit/codex_quota_viewer_state
@@ -227,7 +228,8 @@ spec:
             - name: config
               mountPath: /data
               subPath: .antigravity_cockpit
-              readOnly: true
+              # WAL readers update shared-memory locks even with a mode=ro database connection.
+              readOnly: false
             - name: config
               mountPath: /state
               subPath: .antigravity_cockpit/codex_quota_viewer_state
