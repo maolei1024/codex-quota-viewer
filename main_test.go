@@ -12,6 +12,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -288,14 +289,72 @@ func TestLoadUsageFromSQLiteSupportsMillisecondTimestamps(t *testing.T) {
 
 func TestSQLiteReadOnlyDSNUsesLiveReadOnlyMode(t *testing.T) {
 	dsn := sqliteReadOnlyDSN("/data/codex_local_access_logs.sqlite")
-	if !strings.HasPrefix(dsn, "file:") {
-		t.Fatalf("dsn = %q, want file URI", dsn)
+	uri, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(dsn, "mode=ro") {
-		t.Fatalf("dsn = %q, missing mode=ro", dsn)
+	if uri.Scheme != "file" {
+		t.Fatalf("dsn scheme = %q, want file", uri.Scheme)
+	}
+	query := uri.Query()
+	if got := query.Get("mode"); got != "ro" {
+		t.Fatalf("mode = %q, want ro", got)
+	}
+	if got := query.Get("_pragma"); got != "busy_timeout=5000" {
+		t.Fatalf("_pragma = %q, want busy_timeout=5000", got)
 	}
 	if strings.Contains(dsn, "immutable=") {
 		t.Fatalf("dsn = %q, live WAL databases must not use immutable mode", dsn)
+	}
+}
+
+func TestSQLiteReadOnlyDSNWaitsForTransientLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex_local_access_logs.sqlite")
+	writer, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	writer.SetMaxOpenConns(1)
+	if _, err := writer.Exec(`
+		PRAGMA journal_mode = DELETE;
+		CREATE TABLE request_logs (id INTEGER PRIMARY KEY);
+		INSERT INTO request_logs VALUES (1);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	writerConn, err := writer.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writerConn.Close()
+	if _, err := writerConn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
+		t.Fatal(err)
+	}
+
+	releaseErr := make(chan error, 1)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		_, err := writerConn.ExecContext(ctx, "COMMIT")
+		releaseErr <- err
+	}()
+
+	reader, err := sql.Open("sqlite", sqliteReadOnlyDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	var count int
+	if err := reader.QueryRow("SELECT COUNT(*) FROM request_logs").Scan(&count); err != nil {
+		t.Fatalf("read through transient exclusive lock: %v", err)
+	}
+	if err := <-releaseErr; err != nil {
+		t.Fatalf("release exclusive lock: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("row count = %d, want 1", count)
 	}
 }
 

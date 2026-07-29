@@ -1265,6 +1265,7 @@ func sqliteReadOnlyDSN(path string) string {
 	uri := url.URL{Scheme: "file", Path: path}
 	query := uri.Query()
 	query.Set("mode", "ro")
+	query.Add("_pragma", "busy_timeout=5000")
 	uri.RawQuery = query.Encode()
 	return uri.String()
 }
