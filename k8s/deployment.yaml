@@ -115,7 +115,7 @@ spec:
       volumes:
         - name: config
           persistentVolumeClaim:
-            claimName: cockpit-tools-config-osk
+            claimName: cockpit-tools-config-osk-local
         - name: tmp
           emptyDir:
             medium: Memory
@@ -238,7 +238,7 @@ spec:
       volumes:
         - name: config
           persistentVolumeClaim:
-            claimName: cockpit-tools-config-ash
+            claimName: cockpit-tools-config-ash-local
         - name: tmp
           emptyDir:
             medium: Memory

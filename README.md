@@ -169,7 +169,7 @@ The Woodpecker deploy pipeline publishes an immutable multi-architecture image t
 - `codex-quota-viewer-osk` is pinned to `oracle-osk`.
 - `codex-quota-viewer-ash` is pinned to `oracle-ash`.
 
-Each viewer shares its node's Cockpit Longhorn PVC. `/data` is mounted read-only, while `/state` remains writable for notification deduplication. The pipeline requires the Woodpecker secret `k8s_kubeconfig`.
+Each viewer shares its node's `cockpit-local-static` PVC. `/data` is mounted read-only, while `/state` remains writable for notification deduplication. The pipeline requires the Woodpecker secret `k8s_kubeconfig`.
 
 ```bash
 kubectl rollout status deployment/codex-quota-viewer-osk -n project-cockpit
