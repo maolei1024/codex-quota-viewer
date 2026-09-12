@@ -1,42 +1,53 @@
-# Multi-arch Docker build and push to private Nexus registry.
 matrix:
   ARCH:
-    - amd64
-    - arm64
-
+  - amd64
+  - arm64
 labels:
   arch: ${ARCH}
-
 when:
-  - event: push
-    branch: master
-
+- event:
+  - push
+  - manual
+  branch: master
 steps:
-  - name: test
-    image: golang:1.23-alpine
-    commands:
-      - go test ./...
-
-  - name: build-push
-    image: docker.io/woodpeckerci/plugin-docker-buildx:6.1.1@sha256:9a22c00b4952e405d11e66d29772edbeb1f7b24f27f71cda251ecb838e725e86
-    settings:
-      repo: docker.nexus.ixuni.win/codex-quota-viewer
-      registry: docker.nexus.ixuni.win
-      tags: "latest-${ARCH},v${CI_PIPELINE_NUMBER}-${ARCH}"
-      platforms: "linux/${ARCH}"
-      username:
-        from_secret: nexus_username
-      password:
-        from_secret: nexus_password
-
-  - name: notify-failure
-    image: docker.nexus.ixuni.win/woodpecker-mlntfy:latest
-    pull: true
-    when:
-      - status: [failure]
-    settings:
-      url: https://mlntfy.project.k3s.ixuni.win
-      topic: mlNtfy
-      status: failure
-      priority: high
-      tags: "ci,failure,build,${ARCH}"
+- name: test
+  image: golang:1.23-alpine
+  commands:
+  - go test ./...
+- name: build-push
+  image: docker.io/woodpeckerci/plugin-docker-buildx:6.1.1@sha256:9a22c00b4952e405d11e66d29772edbeb1f7b24f27f71cda251ecb838e725e86
+  settings:
+    repo: docker.nexus.ixuni.win/codex/quota-viewer
+    registry: docker.nexus.ixuni.win
+    tags: candidate-${CI_PIPELINE_NUMBER}-${ARCH}
+    platforms: linux/${ARCH}
+    username:
+      from_secret: nexus_username
+    password:
+      from_secret: nexus_password
+    labels:
+      org.opencontainers.image.source: ${CI_REPO_LINK}
+      org.opencontainers.image.revision: ${CI_COMMIT_SHA}
+      org.opencontainers.image.version: build-${CI_PIPELINE_NUMBER}
+- name: build-push-publish
+  image: docker.io/library/python:3.12-alpine
+  commands:
+  - python3 .ci/image_release.py promote codex/quota-viewer candidate-${CI_PIPELINE_NUMBER}-${ARCH} build-${CI_PIPELINE_NUMBER}-${ARCH}
+    ${ARCH}
+  environment:
+    NEXUS_USERNAME:
+      from_secret: nexus_username
+    NEXUS_PASSWORD:
+      from_secret: nexus_password
+- name: notify-failure
+  image: docker.nexus.ixuni.win/mlntfy/ci:v12@sha256:7a629cffafa1efe242ffada2631177f61f88fd4b3a758a8b71056bc5253a18d5
+  pull: true
+  when:
+  - status:
+    - failure
+  settings:
+    url: https://mlntfy.project.k3s.ixuni.win
+    topic: mlNtfy
+    status: failure
+    priority: high
+    tags: ci,failure,build,${ARCH}

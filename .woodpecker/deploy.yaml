@@ -1,70 +1,73 @@
-# Manifest merge + notification. No runtime deployment is performed here.
 depends_on:
-  - build
-
+- build
 when:
-  - event: push
-    branch: master
-
+- event:
+  - push
+  - manual
+  branch: master
 steps:
-  - name: manifest
-    image: mplatform/manifest-tool:alpine
-    commands:
-      - 'manifest-tool --username=$${NEXUS_USERNAME} --password=$${NEXUS_PASSWORD} push from-args --platforms linux/amd64,linux/arm64 --template docker.nexus.ixuni.win/codex-quota-viewer:latest-ARCH --target docker.nexus.ixuni.win/codex-quota-viewer:latest'
-      - 'manifest-tool --username=$${NEXUS_USERNAME} --password=$${NEXUS_PASSWORD} push from-args --platforms linux/amd64,linux/arm64 --template docker.nexus.ixuni.win/codex-quota-viewer:v${CI_PIPELINE_NUMBER}-ARCH --target docker.nexus.ixuni.win/codex-quota-viewer:v${CI_PIPELINE_NUMBER}'
-    environment:
-      NEXUS_USERNAME:
-        from_secret: nexus_username
-      NEXUS_PASSWORD:
-        from_secret: nexus_password
+- name: manifest
+  image: docker.io/library/python:3.12-alpine
+  commands:
+  - python3 .ci/image_release.py merge codex/quota-viewer build-${CI_PIPELINE_NUMBER} amd64 arm64 --alias latest
+  - python3 .ci/image_release.py pin-files
+  environment:
+    NEXUS_USERNAME:
+      from_secret: nexus_username
+    NEXUS_PASSWORD:
+      from_secret: nexus_password
+- name: deploy
+  image: bitnami/kubectl:latest
+  commands:
+  - mkdir -p ~/.kube
+  - echo "$${K8S_KUBECONFIG}" > ~/.kube/config
+  - chmod 600 ~/.kube/config
+  - 'set -eu
 
-  - name: deploy
-    image: bitnami/kubectl:latest
-    commands:
-      - mkdir -p ~/.kube
-      - 'echo "$${K8S_KUBECONFIG}" > ~/.kube/config'
-      - chmod 600 ~/.kube/config
-      - kubectl apply -f k8s/deployment.yaml
-      - kubectl apply -f k8s/service.yaml
-      - |
-        set -eu
-        namespace=project-cockpit
-        image="docker.nexus.ixuni.win/codex-quota-viewer:v${CI_PIPELINE_NUMBER}"
-        kubectl set image deployment/codex-quota-viewer-osk codex-quota-viewer="$${image}" -n "$${namespace}"
-        kubectl set image deployment/codex-quota-viewer-ash codex-quota-viewer="$${image}" -n "$${namespace}"
-        if ! kubectl rollout status deployment/codex-quota-viewer-osk -n "$${namespace}" --timeout=10m || \
-           ! kubectl rollout status deployment/codex-quota-viewer-ash -n "$${namespace}" --timeout=10m; then
-          kubectl rollout undo deployment/codex-quota-viewer-osk -n "$${namespace}" || true
-          kubectl rollout undo deployment/codex-quota-viewer-ash -n "$${namespace}" || true
-          kubectl rollout status deployment/codex-quota-viewer-osk -n "$${namespace}" --timeout=10m || true
-          kubectl rollout status deployment/codex-quota-viewer-ash -n "$${namespace}" --timeout=10m || true
-          exit 1
-        fi
-        kubectl get deployment/codex-quota-viewer-osk deployment/codex-quota-viewer-ash -n "$${namespace}" \
-          -o custom-columns='NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image,READY:.status.readyReplicas'
-    environment:
-      K8S_KUBECONFIG:
-        from_secret: k8s_kubeconfig
+    previous_osk=$$(kubectl get deployment/codex-quota-viewer-osk -n project-cockpit -o jsonpath=''{.spec.template.spec.containers[?(@.name=="codex-quota-viewer")].image}'')
 
-  - name: notify-success
-    image: docker.nexus.ixuni.win/woodpecker-mlntfy:latest
-    pull: true
-    when:
-      - status: [success]
-    settings:
-      url: https://mlntfy.project.k3s.ixuni.win
-      topic: mlNtfy
-      status: success
-      tags: ci,success,deploy
+    case "$${previous_osk}" in docker.nexus.ixuni.win/codex/quota-viewer:*@sha256:*) ;; *) echo "Previous image must be migrated and digest-pinned
+    before publishing" >&2; exit 1;; esac
 
-  - name: notify-failure
-    image: docker.nexus.ixuni.win/woodpecker-mlntfy:latest
-    pull: true
-    when:
-      - status: [failure]
-    settings:
-      url: https://mlntfy.project.k3s.ixuni.win
-      topic: mlNtfy
-      status: failure
-      priority: high
-      tags: ci,failure,deploy
+    previous_ash=$$(kubectl get deployment/codex-quota-viewer-ash -n project-cockpit -o jsonpath=''{.spec.template.spec.containers[?(@.name=="codex-quota-viewer")].image}'')
+
+    case "$${previous_ash}" in docker.nexus.ixuni.win/codex/quota-viewer:*@sha256:*) ;; *) echo "Previous image must be migrated and digest-pinned
+    before publishing" >&2; exit 1;; esac'
+  - kubectl apply -f k8s/deployment.yaml
+  - kubectl apply -f k8s/service.yaml
+  - "set -eu\nnamespace=project-cockpit\nimage=\"docker.nexus.ixuni.win/codex/quota-viewer:build-${CI_PIPELINE_NUMBER}@$$(cat .ci/digests/codex__quota-viewer)\"\
+    \nkubectl set image deployment/codex-quota-viewer-osk codex-quota-viewer=\"$${image}\" -n \"$${namespace}\"\nkubectl set image deployment/codex-quota-viewer-ash\
+    \ codex-quota-viewer=\"$${image}\" -n \"$${namespace}\"\nif ! kubectl rollout status deployment/codex-quota-viewer-osk -n \"$${namespace}\"\
+    \ --timeout=10m || \\\n   ! kubectl rollout status deployment/codex-quota-viewer-ash -n \"$${namespace}\" --timeout=10m; then\n  kubectl set\
+    \ image deployment/codex-quota-viewer-osk codex-quota-viewer=\"$${previous_osk}\" -n \"$${namespace}\"\n  kubectl set image deployment/codex-quota-viewer-ash\
+    \ codex-quota-viewer=\"$${previous_ash}\" -n \"$${namespace}\"\n  kubectl rollout status deployment/codex-quota-viewer-osk -n \"$${namespace}\"\
+    \ --timeout=10m || true\n  kubectl rollout status deployment/codex-quota-viewer-ash -n \"$${namespace}\" --timeout=10m || true\n  exit 1\n\
+    fi\nkubectl get deployment/codex-quota-viewer-osk deployment/codex-quota-viewer-ash -n \"$${namespace}\" \\\n  -o custom-columns='NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image,READY:.status.readyReplicas'\n"
+  environment:
+    K8S_KUBECONFIG:
+      from_secret: k8s_kubeconfig
+  when:
+  - event: push
+- name: notify-success
+  image: docker.nexus.ixuni.win/mlntfy/ci:v12@sha256:7a629cffafa1efe242ffada2631177f61f88fd4b3a758a8b71056bc5253a18d5
+  pull: true
+  when:
+  - status:
+    - success
+  settings:
+    url: https://mlntfy.project.k3s.ixuni.win
+    topic: mlNtfy
+    status: success
+    tags: ci,success,deploy
+- name: notify-failure
+  image: docker.nexus.ixuni.win/mlntfy/ci:v12@sha256:7a629cffafa1efe242ffada2631177f61f88fd4b3a758a8b71056bc5253a18d5
+  pull: true
+  when:
+  - status:
+    - failure
+  settings:
+    url: https://mlntfy.project.k3s.ixuni.win
+    topic: mlNtfy
+    status: failure
+    priority: high
+    tags: ci,failure,deploy

@@ -41,7 +41,7 @@ spec:
               mountPath: /config
       containers:
         - name: codex-quota-viewer
-          image: docker.nexus.ixuni.win/codex-quota-viewer:latest
+          image: docker.nexus.ixuni.win/codex/quota-viewer:v23@sha256:910d9e784d19afab767991979312b949a07c0c25534b3da548b3c7e1e1f09b7d
           imagePullPolicy: Always
           ports:
             - name: http
@@ -164,7 +164,7 @@ spec:
               mountPath: /config
       containers:
         - name: codex-quota-viewer
-          image: docker.nexus.ixuni.win/codex-quota-viewer:latest
+          image: docker.nexus.ixuni.win/codex/quota-viewer:v23@sha256:910d9e784d19afab767991979312b949a07c0c25534b3da548b3c7e1e1f09b7d
           imagePullPolicy: Always
           ports:
             - name: http

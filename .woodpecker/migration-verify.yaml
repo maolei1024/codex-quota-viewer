@@ -1,0 +1,37 @@
+labels:
+  arch: amd64
+depends_on:
+- name: deploy
+  optional: true
+when:
+- event: manual
+  branch: master
+steps:
+- name: verify-config
+  image: docker.io/library/python:3.12-alpine
+  commands:
+  - python3 -m py_compile .ci/image_release.py
+  - python3 .ci/image_release.py --help
+  - python3 .ci/test_image_release.py
+- name: resolve-verified-artifacts
+  image: docker.io/library/python:3.12-alpine
+  commands:
+  - python3 .ci/image_release.py resolve codex/quota-viewer build-${CI_PIPELINE_NUMBER}
+  - python3 .ci/image_release.py pin-files
+  environment:
+    NEXUS_USERNAME:
+      from_secret: nexus_username
+    NEXUS_PASSWORD:
+      from_secret: nexus_password
+- name: server-dry-run
+  image: docker.io/library/alpine:3.22
+  commands:
+  - set -eu
+  - apk add --no-cache kubectl
+  - umask 077
+  - printf '%s' "$${K8S_KUBECONFIG}" > /tmp/migration-kubeconfig
+  - export KUBECONFIG=/tmp/migration-kubeconfig
+  - kubectl apply --dry-run=server -f k8s/deployment.yaml
+  environment:
+    K8S_KUBECONFIG:
+      from_secret: k8s_kubeconfig
