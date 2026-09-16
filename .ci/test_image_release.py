@@ -29,7 +29,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(json.loads(publish.call_args_list[0].args[2])['manifests'],arch+arm)
             self.assertFalse(publish.call_args_list[0].kwargs.get('mutable',False))
             self.assertTrue(publish.call_args_list[1].kwargs['mutable'])
-    def test_render_uses_published_digest_without_touching_other_images(self):
+    def test_render_uses_published_tag_without_touching_other_images(self):
         before=os.getcwd()
         with tempfile.TemporaryDirectory() as temp:
             try:
@@ -39,6 +39,6 @@ class ReleaseTests(unittest.TestCase):
                 Path('.ci/digests/p__a.ref').write_text(ref+'\n')
                 Path('deploy.yaml').write_text('image: docker.nexus.ixuni.win/p/a:old@sha256:'+'a'*64+'\nother: public/image:latest\n')
                 m.pin_files()
-                self.assertEqual(Path('deploy.yaml').read_text(),'image: '+ref+'\nother: public/image:latest\n')
+                self.assertEqual(Path('deploy.yaml').read_text(),'image: '+ref.split('@')[0]+'\nother: public/image:latest\n')
             finally:os.chdir(before)
 if __name__=='__main__':unittest.main()

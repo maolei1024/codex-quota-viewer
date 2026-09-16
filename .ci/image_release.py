@@ -81,7 +81,7 @@ def pin_files():
     if not config.exists():return
     refs={}
     for p in Path('.ci/digests').glob('*.ref'):
-        ref=p.read_text().strip();refs[ref.split(':',1)[0]]=ref
+        ref=p.read_text().strip().split('@',1)[0];refs[ref.split(':',1)[0]]=ref
     for name in json.loads(config.read_text()):
         p=Path(name)
         text=p.read_text()

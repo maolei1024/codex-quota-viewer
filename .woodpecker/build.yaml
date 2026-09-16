@@ -39,7 +39,7 @@ steps:
     NEXUS_PASSWORD:
       from_secret: nexus_password
 - name: notify-failure
-  image: docker.nexus.ixuni.win/mlntfy/ci:v12@sha256:7a629cffafa1efe242ffada2631177f61f88fd4b3a758a8b71056bc5253a18d5
+  image: docker.nexus.ixuni.win/mlntfy/ci:latest
   pull: true
   when:
   - status:
