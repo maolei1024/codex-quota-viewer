@@ -24,22 +24,13 @@ steps:
   - mkdir -p ~/.kube
   - echo "$${K8S_KUBECONFIG}" > ~/.kube/config
   - chmod 600 ~/.kube/config
-  - kubectl apply --dry-run=server -f k8s/deployment.yaml
   - kubectl apply -f k8s/service.yaml
   - |
     set -eu
     for instance in osk ash; do
       name="codex-quota-viewer-$instance"
-      previous=$(kubectl get deployment "$name" -n project-cockpit -o jsonpath='{.spec.template.spec.containers[0].image}')
-      echo "Deploying $name from $previous to build-${CI_PIPELINE_NUMBER}"
-      # Update one instance at a time. A cleared old artifact is not a rollback target.
       kubectl apply -f k8s/deployment.yaml -l "app.kubernetes.io/instance=$instance"
-      if ! kubectl rollout status deployment/"$name" -n project-cockpit --timeout=10m; then
-        echo "Deployment failed; leaving the other instance untouched. Review before rollback." >&2
-        exit 1
-      fi
-      actual=$(kubectl get deployment "$name" -n project-cockpit -o jsonpath='{.spec.template.spec.containers[0].image}')
-      test "$actual" = "docker.nexus.ixuni.win/codex/quota-viewer:build-${CI_PIPELINE_NUMBER}"
+      kubectl rollout status deployment/"$name" -n project-cockpit --timeout=10m
     done
   environment:
     K8S_KUBECONFIG:

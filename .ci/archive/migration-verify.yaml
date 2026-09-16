@@ -1,3 +1,4 @@
+# Historical migration workflow; not loaded by Woodpecker.
 labels:
   arch: amd64
 depends_on:
