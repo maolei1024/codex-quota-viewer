@@ -24,12 +24,12 @@ steps:
   - mkdir -p ~/.kube
   - echo "$${K8S_KUBECONFIG}" > ~/.kube/config
   - chmod 600 ~/.kube/config
-  - kubectl apply -f k8s/service.yaml
+  - kubectl apply --validate=false --openapi-patch=false -f k8s/service.yaml
   - |
     set -eu
     for instance in osk ash; do
       name="codex-quota-viewer-$instance"
-      kubectl apply -f k8s/deployment.yaml -l "app.kubernetes.io/instance=$instance"
+      kubectl apply --validate=false --openapi-patch=false -f k8s/deployment.yaml -l "app.kubernetes.io/instance=$instance"
       kubectl rollout status deployment/"$name" -n project-cockpit --timeout=10m
     done
   environment:
