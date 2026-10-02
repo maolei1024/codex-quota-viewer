@@ -1489,7 +1489,7 @@ func TestDashboardTemplateRendersNewLayout(t *testing.T) {
 		"模型请求排行",
 		"gpt-5-codex",
 		"m***@**.com",
-		"生成 2026-06-04 13:30:00",
+		">2026-06-04 13:30:00</time>",
 		"var refreshStarted = false",
 		"if (refreshStarted) return",
 		"clearInterval(refreshTimer)",

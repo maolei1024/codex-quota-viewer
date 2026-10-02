@@ -6,6 +6,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"database/sql"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -52,13 +53,14 @@ type config struct {
 }
 
 type rawAccount struct {
-	Email          string          `json:"email"`
-	AuthMode       string          `json:"auth_mode"`
-	PlanType       string          `json:"plan_type"`
-	Quota          *rawQuota       `json:"quota"`
-	QuotaError     *rawQuotaError  `json:"quota_error"`
-	UsageUpdatedAt *int64          `json:"usage_updated_at"`
-	Raw            json.RawMessage `json:"-"`
+	Email                   string          `json:"email"`
+	AuthMode                string          `json:"auth_mode"`
+	PlanType                string          `json:"plan_type"`
+	SubscriptionActiveUntil json.RawMessage `json:"subscription_active_until"`
+	Quota                   *rawQuota       `json:"quota"`
+	QuotaError              *rawQuotaError  `json:"quota_error"`
+	UsageUpdatedAt          *int64          `json:"usage_updated_at"`
+	Raw                     json.RawMessage `json:"-"`
 }
 
 type secureAccountEnvelope struct {
@@ -89,16 +91,17 @@ type rawQuotaError struct {
 }
 
 type accountView struct {
-	AccountKey        string      `json:"-"`
-	Email             string      `json:"email"`
-	AuthMode          string      `json:"authMode"`
-	PlanType          string      `json:"planType"`
-	Hourly            quotaWindow `json:"hourly"`
-	Weekly            quotaWindow `json:"weekly"`
-	UsageUpdatedAt    *int64      `json:"usageUpdatedAt,omitempty"`
-	UsageUpdatedLabel string      `json:"usageUpdatedLabel"`
-	Stale             bool        `json:"stale"`
-	Error             string      `json:"error,omitempty"`
+	AccountKey        string           `json:"-"`
+	Email             string           `json:"email"`
+	AuthMode          string           `json:"authMode"`
+	PlanType          string           `json:"planType"`
+	Subscription      subscriptionView `json:"subscription"`
+	Hourly            quotaWindow      `json:"hourly"`
+	Weekly            quotaWindow      `json:"weekly"`
+	UsageUpdatedAt    *int64           `json:"usageUpdatedAt,omitempty"`
+	UsageUpdatedLabel string           `json:"usageUpdatedLabel"`
+	Stale             bool             `json:"stale"`
+	Error             string           `json:"error,omitempty"`
 }
 
 type quotaWindow struct {
@@ -109,6 +112,16 @@ type quotaWindow struct {
 	Window     string `json:"window"`
 	Class      string `json:"class"`
 	Minutes    int64  `json:"-"`
+}
+
+type subscriptionView struct {
+	Known          bool   `json:"known"`
+	ExpiresAt      *int64 `json:"expiresAt,omitempty"`
+	ExpiresLabel   string `json:"expiresLabel"`
+	RemainingLabel string `json:"remainingLabel"`
+	DaysRemaining  int    `json:"daysRemaining"`
+	Expired        bool   `json:"expired"`
+	Class          string `json:"class"`
 }
 
 type usageTotals struct {
@@ -243,15 +256,23 @@ func main() {
 
 func dashboardFuncs() template.FuncMap {
 	return template.FuncMap{
-		"percent":        percentLabel,
-		"tokens":         compactInt,
-		"cost":           costLabel,
-		"statusClass":    statusClass,
-		"successRate":    successRateLabel,
-		"failureRate":    failureRateLabel,
-		"avgLatency":     avgLatencyLabel,
-		"barWidth":       barWidth,
-		"failurePercent": failurePercent,
+		"percent":               percentLabel,
+		"tokens":                compactInt,
+		"cost":                  costLabel,
+		"statusClass":           statusClass,
+		"successRate":           successRateLabel,
+		"failureRate":           failureRateLabel,
+		"avgLatency":            avgLatencyLabel,
+		"barWidth":              barWidth,
+		"failurePercent":        failurePercent,
+		"resetCountdown":        resetCountdown,
+		"timestamp":             timestamp,
+		"windowLabel":           windowLabel,
+		"accountNeedsAttention": accountNeedsAttention,
+		"accountState":          accountState,
+		"accountStateClass":     accountStateClass,
+		"quotaSort":             quotaSort,
+		"accountAlias":          accountAlias,
 	}
 }
 
@@ -566,6 +587,7 @@ func (a rawAccount) toViewAt(staleAfter time.Duration, now time.Time) accountVie
 		Email:             maskIdentity(a.Email),
 		AuthMode:          dash(a.AuthMode),
 		PlanType:          dash(a.PlanType),
+		Subscription:      buildSubscription(a.SubscriptionActiveUntil, now),
 		UsageUpdatedAt:    a.UsageUpdatedAt,
 		UsageUpdatedLabel: "-",
 	}
@@ -589,6 +611,78 @@ func (a rawAccount) toViewAt(staleAfter time.Duration, now time.Time) accountVie
 		}
 	}
 	return view
+}
+
+func buildSubscription(raw json.RawMessage, now time.Time) subscriptionView {
+	view := subscriptionView{
+		ExpiresLabel:   "未提供到期时间",
+		RemainingLabel: "未提供",
+		Class:          "unknown",
+	}
+	expiresAt := parseSubscriptionExpiresAt(raw)
+	if expiresAt == nil {
+		return view
+	}
+	view.Known = true
+	view.ExpiresAt = expiresAt
+	view.ExpiresLabel = formatTime(*expiresAt)
+	remainingSeconds := *expiresAt - now.Unix()
+	if remainingSeconds <= 0 {
+		view.Expired = true
+		view.RemainingLabel = "已到期"
+		view.Class = "danger"
+		return view
+	}
+	view.DaysRemaining = int(math.Ceil(float64(remainingSeconds) / (24 * 60 * 60)))
+	view.RemainingLabel = fmt.Sprintf("剩余 %d 天", view.DaysRemaining)
+	if remainingSeconds < 24*60*60 {
+		view.RemainingLabel = "不足 1 天"
+	}
+	view.Class = "ok"
+	if view.DaysRemaining <= 7 {
+		view.Class = "warn"
+	}
+	return view
+}
+
+// Cockpit stores the subscription term in subscription_active_until. Token
+// expiry and quota reset timestamps describe different events and are never
+// used as fallbacks. Keep an invalid optional date from dropping the account.
+func parseSubscriptionExpiresAt(raw json.RawMessage) *int64 {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		var number json.Number
+		if err := json.Unmarshal(raw, &number); err != nil {
+			return nil
+		}
+		value = number.String()
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	var expires time.Time
+	if timestamp, err := strconv.ParseInt(value, 10, 64); err == nil {
+		expires = unixTime(timestamp)
+	} else {
+		for _, layout := range []string{
+			time.RFC3339Nano,
+			"2006-01-02 15:04:05Z07:00",
+			"2006-01-02T15:04:05",
+			"2006-01-02 15:04:05",
+			"2006-01-02",
+		} {
+			if parsed, err := time.Parse(layout, value); err == nil {
+				expires = parsed
+				break
+			}
+		}
+	}
+	if expires.IsZero() || expires.Unix() <= 0 || expires.Year() > 9999 {
+		return nil
+	}
+	timestamp := expires.Unix()
+	return &timestamp
 }
 
 func buildWindow(present *bool, remaining int, resetAt *int64, windowMinutes *int64) quotaWindow {
@@ -1508,198 +1602,5 @@ func isUnixMilliseconds(ts int64) bool {
 	return ts >= unixMillisThreshold || ts <= -unixMillisThreshold
 }
 
-var dashboardHTML = `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Codex Quota Viewer</title>
-  <style>
-    :root { color-scheme: light; --bg:#f5f6f8; --panel:#fff; --text:#17202a; --muted:#667085; --line:#d8dde6; --soft:#f0f3f7; --ok:#15803d; --ok-bg:#dcfce7; --warn:#b45309; --warn-bg:#fef3c7; --danger:#b91c1c; --danger-bg:#fee2e2; --accent:#2563eb; }
-    * { box-sizing: border-box; }
-    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
-    header { padding: 22px 28px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
-    h1 { margin: 0 0 8px; font-size: 24px; font-weight: 700; }
-    .muted { color: var(--muted); }
-    main { padding: 20px 28px 32px; max-width: 1280px; margin: 0 auto; }
-    .status-line { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; color: var(--muted); font-size: 13px; }
-    .status-line span { display: inline-flex; align-items: center; gap: 6px; }
-    .dot { width: 7px; height: 7px; border-radius: 999px; background: var(--ok); }
-    .metric, section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
-    .metric { padding: 14px 16px; }
-    .metric span { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
-    .metric strong { font-size: 22px; }
-    section { margin-top: 18px; overflow: hidden; }
-    section h2 { margin: 0; padding: 14px 16px; font-size: 16px; border-bottom: 1px solid var(--line); background: #fbfcfd; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: left; font-size: 14px; vertical-align: middle; }
-    th { font-size: 12px; color: var(--muted); font-weight: 600; background: #fbfcfd; }
-    tr:last-child td { border-bottom: 0; }
-    .pill { display: inline-flex; align-items: center; min-width: 56px; justify-content: center; padding: 3px 8px; border-radius: 999px; font-weight: 700; font-size: 12px; }
-    .ok { color: var(--ok); background: var(--ok-bg); }
-    .warn { color: var(--warn); background: var(--warn-bg); }
-    .danger { color: var(--danger); background: var(--danger-bg); }
-    .unknown { color: var(--muted); background: #eef2f7; }
-    .bar-cell { min-width: 150px; }
-    .quota { display: grid; grid-template-columns: 44px minmax(88px, 1fr); gap: 8px; align-items: center; }
-    .track { height: 8px; overflow: hidden; border-radius: 999px; background: var(--soft); }
-    .fill { height: 100%; border-radius: inherit; background: var(--ok); }
-    .fill.warn { background: var(--warn); }
-    .fill.danger { background: var(--danger); }
-    .fill.unknown { background: #9aa4b2; }
-    .grid3 { display: grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap: 12px; padding: 16px; }
-    .usage-card { border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: #fff; }
-    .usage-card h3 { margin: 0 0 10px; font-size: 14px; }
-    .usage-card dl { display: grid; grid-template-columns: 1fr auto; gap: 7px 12px; margin: 0; font-size: 13px; }
-    .usage-card dt { color: var(--muted); }
-    .usage-card dd { margin: 0; font-weight: 700; }
-    .stack { display: flex; height: 8px; overflow: hidden; border-radius: 999px; background: var(--soft); margin: 12px 0 2px; }
-    .stack .success { background: var(--ok); }
-    .stack .failure { background: var(--danger); }
-    .chart { padding: 8px 16px 12px; }
-    .chart-item { border-bottom: 1px solid var(--line); padding: 8px 0; }
-    .chart-item:last-child { border-bottom: 0; }
-    .chart-row { display: grid; grid-template-columns: minmax(140px, 240px) minmax(120px, 1fr) 84px 84px; gap: 12px; align-items: center; font-size: 14px; }
-    .chart-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .chart-bar { height: 10px; overflow: hidden; border-radius: 999px; background: var(--soft); }
-    .chart-bar span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
-    .account-breakdown { margin: 8px 0 0; padding-left: 18px; display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
-    .account-row { display: grid; grid-template-columns: minmax(120px, 220px) 70px 78px; gap: 10px; align-items: center; }
-    .account-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
-    .empty { padding: 18px 16px; color: var(--muted); }
-    .error { color: var(--danger); max-width: 360px; overflow-wrap: anywhere; }
-    @media (max-width: 860px) { main, header { padding-left: 14px; padding-right: 14px; } .grid3 { grid-template-columns: 1fr; } section { overflow-x: auto; } th, td { white-space: nowrap; } .chart-item { min-width: 520px; } .chart-row { grid-template-columns: 160px 180px 72px 72px; } }
-  </style>
-</head>
-<body data-refresh-seconds="{{.RefreshSeconds}}">
-  <header>
-    <h1>Codex Quota Viewer</h1>
-    <div class="status-line">
-      <span><span class="dot"></span>生成 {{.GeneratedLabel}}</span>
-      <span>用量更新 {{if .LocalAccessUsage.UpdatedLabel}}{{.LocalAccessUsage.UpdatedLabel}}{{else}}-{{end}}</span>
-      <span>数据源 {{.LocalAccessUsage.Source}}</span>
-      <span>自动刷新 <strong id="refresh-label">{{.RefreshLabel}}</strong><span id="refresh-countdown"></span></span>
-    </div>
-  </header>
-  <main>
-    <section>
-      <h2>Codex 账号额度</h2>
-      {{if .Accounts}}
-      <table>
-        <thead><tr><th>账号</th><th>Plan</th><th>认证</th><th>5h 剩余</th><th>5h 重置</th><th>周剩余</th><th>周重置</th><th>缓存更新</th><th>状态</th></tr></thead>
-        <tbody>
-        {{range .Accounts}}
-          <tr>
-            <td>{{.Email}}</td>
-            <td>{{.PlanType}}</td>
-            <td>{{.AuthMode}}</td>
-            <td class="bar-cell">{{if .Hourly.Present}}<div class="quota"><strong>{{.Hourly.Remaining}}%</strong><div class="track"><div class="fill {{.Hourly.Class}}" style="width: {{.Hourly.Remaining}}%"></div></div></div>{{else}}-{{end}}</td>
-            <td>{{.Hourly.ResetLabel}}</td>
-            <td class="bar-cell">{{if .Weekly.Present}}<div class="quota"><strong>{{.Weekly.Remaining}}%</strong><div class="track"><div class="fill {{.Weekly.Class}}" style="width: {{.Weekly.Remaining}}%"></div></div></div>{{else}}-{{end}}</td>
-            <td>{{.Weekly.ResetLabel}}</td>
-            <td>{{.UsageUpdatedLabel}}</td>
-            <td>{{if .Error}}<span class="error">{{.Error}}</span>{{else if .Stale}}<span class="pill warn">stale</span>{{else}}<span class="pill ok">ok</span>{{end}}</td>
-          </tr>
-        {{end}}
-        </tbody>
-      </table>
-      {{else}}<div class="empty">未读取到 Codex 账号缓存。</div>{{end}}
-    </section>
-
-    <section>
-      <h2>本地 API 服务用量</h2>
-      {{if .LocalAccessUsage.Available}}
-      <div class="grid3">
-        <div class="usage-card">
-          <h3>24h</h3>
-          <dl><dt>请求</dt><dd>{{.LocalAccessUsage.Daily.RequestCount}}</dd><dt>成功率</dt><dd>{{successRate .LocalAccessUsage.Daily}}</dd><dt>失败率</dt><dd>{{failureRate .LocalAccessUsage.Daily}}</dd><dt>平均延迟</dt><dd>{{avgLatency .LocalAccessUsage.Daily}}</dd><dt>成本</dt><dd>{{cost .LocalAccessUsage.Daily.EstimatedCostUSD}}</dd></dl>
-          <div class="stack"><span class="success" style="width: {{barWidth .LocalAccessUsage.Daily.SuccessCount .LocalAccessUsage.Daily.RequestCount}}%"></span><span class="failure" style="width: {{failurePercent .LocalAccessUsage.Daily}}%"></span></div>
-        </div>
-        <div class="usage-card">
-          <h3>7d</h3>
-          <dl><dt>请求</dt><dd>{{.LocalAccessUsage.Weekly.RequestCount}}</dd><dt>成功率</dt><dd>{{successRate .LocalAccessUsage.Weekly}}</dd><dt>失败率</dt><dd>{{failureRate .LocalAccessUsage.Weekly}}</dd><dt>平均延迟</dt><dd>{{avgLatency .LocalAccessUsage.Weekly}}</dd><dt>成本</dt><dd>{{cost .LocalAccessUsage.Weekly.EstimatedCostUSD}}</dd></dl>
-          <div class="stack"><span class="success" style="width: {{barWidth .LocalAccessUsage.Weekly.SuccessCount .LocalAccessUsage.Weekly.RequestCount}}%"></span><span class="failure" style="width: {{failurePercent .LocalAccessUsage.Weekly}}%"></span></div>
-        </div>
-        <div class="usage-card">
-          <h3>30d</h3>
-          <dl><dt>请求</dt><dd>{{.LocalAccessUsage.Monthly.RequestCount}}</dd><dt>成功率</dt><dd>{{successRate .LocalAccessUsage.Monthly}}</dd><dt>失败率</dt><dd>{{failureRate .LocalAccessUsage.Monthly}}</dd><dt>平均延迟</dt><dd>{{avgLatency .LocalAccessUsage.Monthly}}</dd><dt>成本</dt><dd>{{cost .LocalAccessUsage.Monthly.EstimatedCostUSD}}</dd></dl>
-          <div class="stack"><span class="success" style="width: {{barWidth .LocalAccessUsage.Monthly.SuccessCount .LocalAccessUsage.Monthly.RequestCount}}%"></span><span class="failure" style="width: {{failurePercent .LocalAccessUsage.Monthly}}%"></span></div>
-        </div>
-      </div>
-      {{else}}<div class="empty">未读取到本地 API 服务用量数据。{{.LocalAccessUsage.Error}}</div>{{end}}
-    </section>
-
-    <section>
-      <h2>模型请求排行</h2>
-      {{if .LocalAccessUsage.Models}}
-      <div class="chart">
-        {{range .LocalAccessUsage.Models}}
-        <div class="chart-item">
-          <div class="chart-row">
-            <div class="chart-label">{{.ModelID}}</div>
-            <div class="chart-bar"><span style="width: {{barWidth .Usage.RequestCount $.MaxModelRequests}}%"></span></div>
-            <div>{{.Usage.RequestCount}} 次</div>
-            <div>{{cost .Usage.EstimatedCostUSD}}</div>
-          </div>
-          {{if .Accounts}}
-          <div class="account-breakdown">
-            {{range .Accounts}}
-            <div class="account-row">
-              <span class="account-name">{{.Account}}</span>
-              <span>{{.Usage.RequestCount}} 次</span>
-              <span>{{cost .Usage.EstimatedCostUSD}}</span>
-            </div>
-            {{end}}
-          </div>
-          {{end}}
-        </div>
-        {{end}}
-      </div>
-      {{else}}<div class="empty">暂无模型维度用量。</div>{{end}}
-    </section>
-
-    {{if or .StaleCount .ErrorCount}}
-    <section>
-      <h2>异常</h2>
-      <table>
-        <thead><tr><th>类型</th><th>数量</th></tr></thead>
-        <tbody>
-          {{if .StaleCount}}<tr><td>额度缓存过期</td><td>{{.StaleCount}}</td></tr>{{end}}
-          {{if .ErrorCount}}<tr><td>账号额度错误</td><td>{{.ErrorCount}}</td></tr>{{end}}
-        </tbody>
-      </table>
-    </section>
-    {{end}}
-  </main>
-  <script>
-    (function () {
-      var refreshSeconds = Number(document.body.dataset.refreshSeconds || "0");
-      if (!Number.isFinite(refreshSeconds) || refreshSeconds <= 0) return;
-      var countdown = document.getElementById("refresh-countdown");
-      var nextRefreshAt = Date.now() + refreshSeconds * 1000;
-      var refreshStarted = false;
-      var refreshTimer;
-      function refreshOnce() {
-        if (refreshStarted) return;
-        refreshStarted = true;
-        if (refreshTimer !== undefined) clearInterval(refreshTimer);
-        window.location.reload();
-      }
-      function renderCountdown() {
-        var remaining = Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000));
-        var minutes = Math.floor(remaining / 60);
-        var seconds = String(remaining % 60).padStart(2, "0");
-        if (countdown) countdown.textContent = " · " + minutes + ":" + seconds;
-        if (remaining <= 0) refreshOnce();
-      }
-      refreshTimer = setInterval(renderCountdown, 1000);
-      document.addEventListener("visibilitychange", function () {
-        if (document.visibilityState === "visible" && Date.now() >= nextRefreshAt) {
-          refreshOnce();
-        }
-      });
-      renderCountdown();
-    })();
-  </script>
-</body>
-</html>`
+//go:embed dashboard.html
+var dashboardHTML string

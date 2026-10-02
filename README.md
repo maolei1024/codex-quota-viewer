@@ -10,6 +10,25 @@ When configured, it can also send webhook notifications when a Codex account's
 weekly quota first reaches 3% or less in a quota cycle, its weekly quota window
 resets, or its quota cache becomes stale.
 
+## Dashboard
+
+The dashboard prioritizes each account's remaining quota, reset countdown and
+exact reset time, and subscription days remaining and expiration date. Account
+cards use a single column on phones and a two-column layout on larger screens.
+API costs, success rates, and model usage remain available in a collapsed
+section below the accounts.
+
+Search by masked account identity, account alias, or plan, and sort by remaining
+quota, next reset, or subscription expiration. Stable anonymous aliases help
+distinguish accounts whose masked identities match. The **需要关注** filter shows
+accounts with any reported quota window at 20% or less, a subscription expiring
+within seven days or already expired, a quota error, or stale cached data.
+These display thresholds do not change the notification thresholds below.
+
+Dates are displayed in the browser's timezone, shown in the page footer, and
+countdowns update automatically. Reaching a cached reset time shows that the
+account is waiting for synchronization; it does not assume quota has refilled.
+
 ## Data Sources
 
 Mount the Cockpit Tools data directory as `/data:ro`:
@@ -25,8 +44,16 @@ local key, then exposes only the same masked quota view as before. Plaintext
 account files remain supported for older Cockpit Tools versions.
 
 Quota windows are classified by their reported duration. This keeps a lone
-7-day primary window in the weekly column even when Cockpit stores it in its
-legacy `hourly_*` slot.
+7-day primary window in the weekly quota display even when Cockpit stores it in
+its legacy `hourly_*` slot.
+
+Subscription expiration comes only from the account's
+`subscription_active_until` field. ISO dates and Unix-second or
+Unix-millisecond timestamps are accepted; dates without an explicit timezone
+are interpreted as UTC. If Cockpit has not supplied a valid date, the dashboard
+shows **未提供**. It never infers a subscription term from token expiration,
+quota reset times, or the plan name. Expiration information shares the freshness
+limitations of Cockpit's cached account data.
 
 `codex_local_access_stats.json` contains precomputed aggregate windows such as
 totals, account totals, model totals, and API key totals. It does not retain the

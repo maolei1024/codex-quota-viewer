@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f5f6f8">
+  <title>Codex 额度看板</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f6f8; --panel: #fff; --text: #17202a; --muted: #626d7e;
+      --line: #dde2e9; --soft: #edf0f4; --accent: #245bd6; --accent-soft: #edf3ff;
+      --ok: #167044; --ok-bg: #e9f5ed; --warn: #96500b; --warn-bg: #fff4dc;
+      --danger: #b52b32; --danger-bg: #fcecef; --radius: 12px;
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); font-size: 16px; line-height: 1.5; -webkit-text-size-adjust: 100%; }
+    ::selection { background: #dce7ff; color: #163a85; }
+    :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+    button, input, select { font: inherit; color: inherit; }
+    button, select, summary { cursor: pointer; touch-action: manipulation; }
+    button, input, select { min-height: 44px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+    button { padding: 9px 14px; font-weight: 600; }
+    button:active { background: var(--soft); }
+    button:disabled { cursor: wait; opacity: .65; }
+    input { width: 100%; min-width: 0; padding: 9px 12px; caret-color: var(--accent); }
+    input::placeholder { color: var(--muted); }
+    select { width: 100%; min-width: 0; padding: 9px 28px 9px 10px; }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    h1, h2, h3, p { margin: 0; }
+    .muted { color: var(--muted); }
+    .num, time { font-variant-numeric: tabular-nums; }
+    .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+    .skip-link { position: absolute; top: 8px; left: 16px; z-index: 2; padding: 12px; background: var(--panel); transform: translateY(-150%); }
+    .skip-link:focus { transform: none; }
+    .shell { width: 100%; max-width: 1200px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left)); padding-right: max(16px, env(safe-area-inset-right)); }
+    .site-header { background: var(--panel); border-bottom: 1px solid var(--line); }
+    .header-inner { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding-top: 18px; padding-bottom: 18px; }
+    h1 { font-size: 20px; font-weight: 700; letter-spacing: -.025em; }
+    .header-note { margin-top: 3px; color: var(--muted); font-size: 13px; }
+    .refresh-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; font-size: 14px; }
+    .refresh-button svg { width: 16px; height: 16px; flex: none; }
+    main { padding-top: 24px; padding-bottom: max(32px, env(safe-area-inset-bottom)); }
+    .section-heading { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 5px 16px; }
+    h2 { font-size: 20px; letter-spacing: -.02em; }
+    .account-total { color: var(--muted); font-size: 14px; }
+    .intro { margin-top: 6px; color: var(--muted); font-size: 14px; }
+    .toolbar { display: grid; gap: 12px; margin: 20px 0 16px; }
+    .filters { display: flex; gap: 4px; align-items: center; }
+    .filter-button { border-color: transparent; background: transparent; color: var(--muted); font-size: 14px; padding: 9px 12px; }
+    .filter-button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); }
+    .filter-count { margin-left: 5px; font-variant-numeric: tabular-nums; }
+    .search-sort { display: grid; grid-template-columns: minmax(0, 1fr) 142px; gap: 8px; }
+    .search-sort select { font-size: 16px; }
+    .account-grid { display: grid; gap: 16px; }
+    .account-card { min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; }
+    .account-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .account-identity { min-width: 0; }
+    .account-identity h3 { font-size: 16px; font-weight: 650; overflow-wrap: anywhere; }
+    .account-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 5px; color: var(--muted); font-size: 12px; }
+    .plan { font-size: 12px; font-weight: 600; color: var(--text); background: var(--soft); border-radius: 4px; padding: 1px 6px; overflow-wrap: anywhere; }
+    .status { flex: none; display: inline-flex; align-items: center; gap: 5px; font-size: 12px; line-height: 1.6; font-weight: 600; padding: 3px 8px; border-radius: 5px; }
+    .status::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .danger { color: var(--danger); }
+    .status.ok { background: var(--ok-bg); }
+    .status.warn { background: var(--warn-bg); }
+    .status.danger { background: var(--danger-bg); }
+    .status.muted, .status.unknown { background: var(--soft); color: var(--muted); }
+    .quotas { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; margin: 22px 0 18px; }
+    .quota + .quota { border-left: 1px solid var(--line); padding-left: 16px; }
+    .quota-label { color: var(--muted); font-size: 13px; }
+    .quota-value { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin: 3px 0 8px; }
+    .quota-value strong { font-size: 32px; line-height: 1.25; font-weight: 650; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+    .quota-value strong small { font-size: 18px; margin-left: 1px; }
+    .quota-value > span { font-size: 12px; color: var(--muted); }
+    .track { height: 5px; background: var(--soft); border-radius: 3px; overflow: hidden; }
+    .fill { height: 100%; background: var(--ok); border-radius: inherit; }
+    .fill.warn { background: var(--warn); }
+    .fill.danger { background: var(--danger); }
+    .reset-countdown { display: block; font-size: 13px; font-weight: 600; margin-top: 11px; overflow-wrap: anywhere; }
+    .reset-date { display: block; color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
+    .quota-missing { margin-top: 8px; font-size: 20px; font-weight: 600; color: var(--muted); }
+    .quota-unavailable { font-size: 12px; color: var(--muted); margin-top: 10px; }
+    .subscription { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding-top: 15px; border-top: 1px solid var(--line); }
+    .subscription-label { color: var(--muted); font-size: 13px; padding-top: 2px; flex: none; }
+    .subscription-info { min-width: 0; text-align: right; }
+    .subscription-info strong { font-size: 16px; font-weight: 650; }
+    .subscription-info .unknown { color: var(--muted); font-weight: 500; font-size: 14px; }
+    .subscription-date { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .account-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; color: var(--muted); font-size: 12px; margin-top: 16px; }
+    .account-notice { margin-top: 12px; font-size: 13px; color: var(--warn); }
+    .account-error { color: var(--danger); margin-top: 10px; font-size: 13px; overflow-wrap: anywhere; }
+    .account-error summary { min-height: 44px; padding: 10px 0; }
+    .account-error p { padding: 0 0 8px; }
+    .empty { padding: 32px 20px; border: 1px dashed var(--line); border-radius: var(--radius); text-align: center; color: var(--muted); }
+    .empty h3 { color: var(--text); font-size: 16px; margin-bottom: 6px; }
+    .empty p { font-size: 14px; }
+    .empty button { margin-top: 16px; }
+    .secondary { margin-top: 28px; border-top: 1px solid var(--line); }
+    .secondary > summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 0; list-style: none; }
+    .secondary > summary::-webkit-details-marker { display: none; }
+    .secondary-title { display: block; font-size: 15px; font-weight: 600; }
+    .secondary-description { display: block; font-size: 13px; color: var(--muted); margin-top: 2px; }
+    .disclosure { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 13px; flex: none; }
+    .disclosure svg { width: 16px; height: 16px; transition: transform 180ms ease-out; }
+    .secondary[open] .disclosure svg { transform: rotate(180deg); }
+    .when-open { display: none; }
+    .secondary[open] .when-open { display: inline; }
+    .secondary[open] .when-closed { display: none; }
+    .usage-grid { display: grid; gap: 24px; padding: 8px 0 24px; }
+    .usage-period h3, .models h3 { font-size: 14px; margin-bottom: 12px; }
+    .usage-period dl { display: grid; grid-template-columns: 1fr auto; gap: 8px 12px; margin: 0; font-size: 13px; }
+    .usage-period dt { color: var(--muted); }
+    .usage-period dd { margin: 0; font-variant-numeric: tabular-nums; }
+    .models { padding: 20px 0; border-top: 1px solid var(--line); }
+    .chart-item { padding: 12px 0; border-bottom: 1px solid var(--line); }
+    .chart-item:last-child { border: 0; }
+    .chart-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: center; font-size: 13px; }
+    .chart-label { overflow-wrap: anywhere; }
+    .chart-bar { grid-column: 1 / -1; grid-row: 2; height: 4px; border-radius: 2px; overflow: hidden; background: var(--soft); }
+    .chart-bar span { display: block; height: 100%; background: var(--accent); }
+    .account-breakdown { margin-top: 10px; display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
+    .account-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; }
+    .account-name { overflow-wrap: anywhere; }
+    .page-footer { margin-top: 12px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 24px; }
+    .page-footer p { max-width: 70ch; }
+    .js-only { display: none; }
+    .js-enabled .js-only { display: grid; }
+    .js-enabled .refresh-button { display: inline-flex; }
+    @media (min-width: 640px) {
+      .shell { padding-left: max(28px, env(safe-area-inset-left)); padding-right: max(28px, env(safe-area-inset-right)); }
+      .header-inner { padding-top: 22px; padding-bottom: 22px; }
+      h1 { font-size: 22px; }
+      main { padding-top: 30px; }
+      .toolbar { grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 20px; }
+      .search-sort { max-width: 410px; width: 100%; justify-self: end; }
+      .search-sort select { font-size: 14px; }
+      .account-card { padding: 22px; }
+      .quota-value strong { font-size: 36px; }
+      .reset-countdown { font-size: 14px; }
+      .usage-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .usage-period + .usage-period { padding-left: 24px; border-left: 1px solid var(--line); }
+      .chart-row { grid-template-columns: minmax(140px, 1fr) minmax(100px, 1fr) 80px 90px; }
+      .chart-bar { grid-column: auto; grid-row: auto; }
+    }
+    @media (min-width: 960px) {
+      .account-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+      .account-card:only-child { grid-column: 1 / -1; max-width: 740px; width: 100%; }
+    }
+    @media (hover: hover) {
+      button:hover:not(:disabled) { border-color: #a8b4c6; background: var(--soft); }
+      .filter-button:hover:not(:disabled) { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+      summary:hover { color: var(--accent); }
+    }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; } }
+  </style>
+</head>
+<body data-refresh-seconds="{{.RefreshSeconds}}" data-generated-at="{{.GeneratedAt}}">
+  <a class="skip-link" href="#accounts">跳到账号额度</a>
+  <header class="site-header">
+    <div class="shell header-inner">
+      <div>
+        <h1>Codex 额度看板</h1>
+        <p class="header-note">{{if gt .RefreshSeconds 0}}每 {{.RefreshLabel}} 自动刷新<span id="refresh-countdown" class="num"></span>{{else}}自动刷新已关闭{{end}}</p>
+      </div>
+      <button type="button" class="refresh-button js-only" id="refresh-button">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 6.1a8 8 0 0 1 13.2 3L20 12M4 12l.7 2.9a8 8 0 0 0 13.2 3"/></svg>
+        <span>刷新数据</span>
+      </button>
+    </div>
+  </header>
+  <main class="shell">
+    <section id="accounts" aria-labelledby="accounts-title">
+      <div class="section-heading">
+        <h2 id="accounts-title">账号额度</h2>
+        <span class="account-total">共 <strong class="num">{{len .Accounts}}</strong> 个账号<span id="attention-total"></span></span>
+      </div>
+      <p class="intro">查看剩余额度、重置时间与套餐有效期。</p>
+      {{if .Accounts}}
+      <div class="toolbar js-only">
+        <div class="filters" role="group" aria-label="筛选账号">
+          <button type="button" class="filter-button" data-filter="all" aria-pressed="true">全部账号<span class="filter-count">{{len .Accounts}}</span></button>
+          <button type="button" class="filter-button" data-filter="attention" aria-pressed="false">需要关注<span class="filter-count" id="attention-count">0</span></button>
+        </div>
+        <div class="search-sort">
+          <label><span class="visually-hidden">搜索账号或套餐</span><input type="search" id="account-search" placeholder="搜索账号或套餐" autocomplete="off" spellcheck="false"></label>
+          <label><span class="visually-hidden">账号排序</span><select id="account-sort"><option value="default">默认排序</option><option value="quota">剩余额度最多</option><option value="reset">最早重置</option><option value="expiry">最早到期</option></select></label>
+        </div>
+      </div>
+      <p id="filter-result" class="visually-hidden" role="status" aria-live="polite"></p>
+      <div class="account-grid" id="account-grid">
+        {{range $index, $account := .Accounts}}
+        <article class="account-card" aria-labelledby="account-{{$index}}" data-index="{{$index}}" data-search="{{.Email}} {{.PlanType}} {{accountAlias .}}" data-error="{{if .Error}}true{{else}}false{{end}}" data-stale="{{.Stale}}" data-quota="{{quotaSort .}}" data-expiry="{{timestamp .Subscription.ExpiresAt}}">
+          <div class="account-heading">
+            <div class="account-identity">
+              <h3 id="account-{{$index}}">{{.Email}}</h3>
+              <div class="account-meta"><span class="plan">{{.PlanType}}</span>{{if accountAlias .}}<span>账号 {{accountAlias .}}</span>{{end}}</div>
+            </div>
+            <span class="status {{accountStateClass .}}">{{accountState .}}</span>
+          </div>
+          <div class="quotas">
+            <div class="quota">
+              <p class="quota-label">{{windowLabel .Hourly "5 小时额度"}}</p>
+              {{if .Hourly.Present}}
+              <div class="quota-value"><strong class="{{.Hourly.Class}}">{{.Hourly.Remaining}}<small>%</small></strong><span>剩余</span></div>
+              <div class="track" aria-hidden="true"><div class="fill {{.Hourly.Class}}" style="width: {{.Hourly.Remaining}}%"></div></div>
+              <span class="reset-countdown" data-reset-at="{{timestamp .Hourly.ResetAt}}">{{resetCountdown .Hourly.ResetAt $.GeneratedAt}}</span>
+              {{if .Hourly.ResetAt}}<time class="reset-date" data-time="{{timestamp .Hourly.ResetAt}}">{{.Hourly.ResetLabel}}</time>{{end}}
+              {{else}}<p class="quota-missing">未提供</p><p class="quota-unavailable">暂无此额度窗口</p>{{end}}
+            </div>
+            <div class="quota">
+              <p class="quota-label">{{windowLabel .Weekly "周额度"}}</p>
+              {{if .Weekly.Present}}
+              <div class="quota-value"><strong class="{{.Weekly.Class}}">{{.Weekly.Remaining}}<small>%</small></strong><span>剩余</span></div>
+              <div class="track" aria-hidden="true"><div class="fill {{.Weekly.Class}}" style="width: {{.Weekly.Remaining}}%"></div></div>
+              <span class="reset-countdown" data-reset-at="{{timestamp .Weekly.ResetAt}}">{{resetCountdown .Weekly.ResetAt $.GeneratedAt}}</span>
+              {{if .Weekly.ResetAt}}<time class="reset-date" data-time="{{timestamp .Weekly.ResetAt}}">{{.Weekly.ResetLabel}}</time>{{end}}
+              {{else}}<p class="quota-missing">未提供</p><p class="quota-unavailable">暂无此额度窗口</p>{{end}}
+            </div>
+          </div>
+          <div class="subscription">
+            <span class="subscription-label">套餐有效期</span>
+            <div class="subscription-info">
+              {{if .Subscription.Known}}
+              <strong class="{{.Subscription.Class}}" data-expires-at="{{timestamp .Subscription.ExpiresAt}}">{{.Subscription.RemainingLabel}}</strong>
+              <span class="subscription-date"><time data-time="{{timestamp .Subscription.ExpiresAt}}">{{.Subscription.ExpiresLabel}}</time> 到期</span>
+              {{else}}<strong class="unknown">未提供</strong><span class="subscription-date">暂无套餐到期信息</span>{{end}}
+            </div>
+          </div>
+          <div class="account-footer">
+            <span>{{if .UsageUpdatedAt}}缓存更新 <time data-time="{{timestamp .UsageUpdatedAt}}">{{.UsageUpdatedLabel}}</time>{{else}}尚无缓存更新时间{{end}}</span>
+            <span>{{.AuthMode}}</span>
+          </div>
+          {{if .Stale}}<p class="account-notice">缓存已过期，当前额度可能有变化。请检查 Cockpit 同步。</p>{{end}}
+          {{if .Error}}<details class="account-error"><summary>额度读取异常 · 查看详情</summary><p>{{.Error}}</p></details>{{end}}
+        </article>
+        {{end}}
+      </div>
+      <div class="empty" id="filter-empty" hidden><h3>没有符合条件的账号</h3><p>试试其他关键词，或查看全部账号。</p><button type="button" id="clear-filters">清除筛选</button></div>
+      {{else}}
+      <div class="empty" style="margin-top: 20px"><h3>还没有账号额度</h3><p>请先在 Cockpit 添加账号并同步额度，再刷新此页面。</p></div>
+      {{end}}
+    </section>
+
+    <details class="secondary" id="usage-details">
+      <summary>
+        <span><span class="secondary-title">API 用量与模型统计</span><span class="secondary-description">费用、成功率及请求明细</span></span>
+        <span class="disclosure"><span class="when-closed">展开</span><span class="when-open">收起</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span>
+      </summary>
+      {{if .LocalAccessUsage.Available}}
+      <div class="usage-grid">
+        <div class="usage-period"><h3>最近 24 小时</h3><dl><dt>请求</dt><dd>{{.LocalAccessUsage.Daily.RequestCount}}</dd><dt>成功率</dt><dd>{{successRate .LocalAccessUsage.Daily}}</dd><dt>失败率</dt><dd>{{failureRate .LocalAccessUsage.Daily}}</dd><dt>平均延迟</dt><dd>{{avgLatency .LocalAccessUsage.Daily}}</dd><dt>估算费用</dt><dd>{{cost .LocalAccessUsage.Daily.EstimatedCostUSD}}</dd></dl></div>
+        <div class="usage-period"><h3>最近 7 天</h3><dl><dt>请求</dt><dd>{{.LocalAccessUsage.Weekly.RequestCount}}</dd><dt>成功率</dt><dd>{{successRate .LocalAccessUsage.Weekly}}</dd><dt>失败率</dt><dd>{{failureRate .LocalAccessUsage.Weekly}}</dd><dt>平均延迟</dt><dd>{{avgLatency .LocalAccessUsage.Weekly}}</dd><dt>估算费用</dt><dd>{{cost .LocalAccessUsage.Weekly.EstimatedCostUSD}}</dd></dl></div>
+        <div class="usage-period"><h3>最近 30 天</h3><dl><dt>请求</dt><dd>{{.LocalAccessUsage.Monthly.RequestCount}}</dd><dt>成功率</dt><dd>{{successRate .LocalAccessUsage.Monthly}}</dd><dt>失败率</dt><dd>{{failureRate .LocalAccessUsage.Monthly}}</dd><dt>平均延迟</dt><dd>{{avgLatency .LocalAccessUsage.Monthly}}</dd><dt>估算费用</dt><dd>{{cost .LocalAccessUsage.Monthly.EstimatedCostUSD}}</dd></dl></div>
+      </div>
+      {{else}}<div class="empty"><p>未读取到本地 API 服务用量数据。{{.LocalAccessUsage.Error}}</p></div>{{end}}
+      <div class="models">
+        <h3>模型请求排行</h3>
+        {{if .LocalAccessUsage.Models}}
+        <div class="chart">
+          {{range .LocalAccessUsage.Models}}
+          <div class="chart-item">
+            <div class="chart-row"><span class="chart-label">{{.ModelID}}</span><div class="chart-bar" aria-hidden="true"><span style="width: {{barWidth .Usage.RequestCount $.MaxModelRequests}}%"></span></div><span class="num">{{.Usage.RequestCount}} 次</span><span class="num">{{cost .Usage.EstimatedCostUSD}}</span></div>
+            {{if .Accounts}}<div class="account-breakdown">{{range .Accounts}}<div class="account-row"><span class="account-name">{{.Account}}</span><span class="num">{{.Usage.RequestCount}} 次</span><span class="num">{{cost .Usage.EstimatedCostUSD}}</span></div>{{end}}</div>{{end}}
+          </div>
+          {{end}}
+        </div>
+        {{else}}<p class="muted">暂无模型维度用量。</p>{{end}}
+      </div>
+    </details>
+    <footer class="page-footer">
+      <p>额度以 Cockpit 最近同步为准；到达重置时间后，需等待新数据确认。</p>
+      <p>生成 <time data-time="{{.GeneratedAt}}">{{.GeneratedLabel}}</time> · <span id="time-zone">服务器时间</span></p>
+    </footer>
+    <noscript><p class="intro">当前显示页面生成时的额度和剩余时间。重新加载页面可查看更新。</p></noscript>
+  </main>
+  <script>
+    (function () {
+      "use strict";
+      document.documentElement.classList.add("js-enabled");
+      var refreshSeconds = Number(document.body.dataset.refreshSeconds || "0");
+      var generatedAt = Number(document.body.dataset.generatedAt) * 1000;
+      var startedAt = Date.now();
+      // Use elapsed wall time: preserve the server reference while including device sleep.
+      var anchorAt = generatedAt > 0 ? generatedAt : Date.now();
+      function now() { return anchorAt + Date.now() - startedAt; }
+      var nextRefreshAt = now() + refreshSeconds * 1000;
+      var countdown = document.getElementById("refresh-countdown");
+      var refreshButton = document.getElementById("refresh-button");
+      var refreshStarted = false;
+      var refreshTimer;
+      var cards = Array.from(document.querySelectorAll(".account-card"));
+      var grid = document.getElementById("account-grid");
+      var search = document.getElementById("account-search");
+      var sort = document.getElementById("account-sort");
+      var filterButtons = Array.from(document.querySelectorAll("[data-filter]"));
+      var activeFilter = "all";
+      var usageDetails = document.getElementById("usage-details");
+      var stateKey = "codex-quota-dashboard-state";
+      var resetNodes = Array.from(document.querySelectorAll("[data-reset-at]"));
+      var expiryNodes = Array.from(document.querySelectorAll("[data-expires-at]"));
+      var dateFormatter = new Intl.DateTimeFormat("zh-CN", {year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false});
+      document.getElementById("time-zone").textContent = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      document.querySelectorAll("time[data-time]").forEach(function (node) {
+        var value = Number(node.dataset.time);
+        if (value > 0) {
+          var date = new Date(value * 1000);
+          if (!Number.isFinite(date.getTime())) { node.textContent = "时间未知"; return; }
+          node.dateTime = date.toISOString();
+          node.textContent = dateFormatter.format(date);
+        }
+      });
+      function saveState() {
+        try {
+          sessionStorage.setItem(stateKey, JSON.stringify({filter: activeFilter, query: search ? search.value : "", sort: sort ? sort.value : "default", usageOpen: usageDetails.open, scroll: window.scrollY}));
+        } catch (_) { /* Browsing with storage disabled still supports all controls. */ }
+      }
+      function refreshOnce() {
+        if (refreshStarted) return;
+        refreshStarted = true;
+        if (refreshTimer !== undefined) clearInterval(refreshTimer);
+        saveState();
+        refreshButton.disabled = true;
+        refreshButton.querySelector("span").textContent = "正在刷新";
+        window.location.reload();
+      }
+      refreshButton.addEventListener("click", refreshOnce);
+      function resetLabel(at, current) {
+        if (!(at > 0) || !Number.isFinite(new Date(at * 1000).getTime())) return "重置时间未知";
+        var seconds = Math.ceil(at - current / 1000);
+        if (seconds <= 0) return "已到重置时间，等待同步";
+        if (seconds < 60) return "不到 1 分钟后重置";
+        var minutes = Math.floor(seconds / 60);
+        var days = Math.floor(minutes / 1440);
+        var hours = Math.floor(minutes / 60) % 24;
+        if (days > 0) return days + "天" + (hours ? " " + hours + "小时" : "") + "后重置";
+        if (hours > 0) return hours + "小时" + (minutes % 60 ? " " + minutes % 60 + "分钟" : "") + "后重置";
+        return minutes + "分钟后重置";
+      }
+      function updateTimes() {
+        var current = now();
+        resetNodes.forEach(function (node) { node.textContent = resetLabel(Number(node.dataset.resetAt), current); });
+        expiryNodes.forEach(function (node) {
+          var remaining = Number(node.dataset.expiresAt) * 1000 - current;
+          var days = Math.ceil(remaining / 86400000);
+          node.textContent = remaining <= 0 ? "已到期" : remaining < 86400000 ? "不足 1 天" : "剩余 " + days + " 天";
+          node.className = remaining <= 0 ? "danger" : days <= 7 ? "warn" : "ok";
+        });
+        cards.forEach(function (card) {
+          var status = card.querySelector(".status");
+          var expires = Number(card.dataset.expiry);
+          var remaining = expires * 1000 - current;
+          var quota = Number(card.dataset.quota);
+          var label = "正常", style = "ok";
+          if (card.dataset.error === "true") { label = "读取异常"; style = "danger"; }
+          else if (card.dataset.stale === "true") { label = "缓存过期"; style = "warn"; }
+          else if (expires > 0 && remaining <= 0) { label = "套餐已到期"; style = "danger"; }
+          else if (quota <= 20) { label = "额度不足"; style = "danger"; }
+          else if (expires > 0 && remaining <= 7 * 86400000) { label = "套餐即将到期"; style = "warn"; }
+          else if (quota === 101) { label = "暂无额度"; style = "muted"; }
+          if (status.textContent !== label) status.textContent = label;
+          status.className = "status " + style;
+        });
+        if (Number.isFinite(refreshSeconds) && refreshSeconds > 0) {
+          var remaining = Math.max(0, Math.ceil((nextRefreshAt - current) / 1000));
+          countdown.textContent = " · " + Math.floor(remaining / 60) + ":" + String(remaining % 60).padStart(2, "0");
+          if (remaining <= 0 && document.visibilityState === "visible") refreshOnce();
+        }
+      }
+      function needsAttention(card) {
+        var expires = Number(card.dataset.expiry);
+        return card.dataset.error === "true" || card.dataset.stale === "true" || Number(card.dataset.quota) <= 20 || expires > 0 && expires * 1000 - now() <= 7 * 86400000;
+      }
+      function nextReset(card) {
+        var times = Array.from(card.querySelectorAll("[data-reset-at]")).map(function (node) { return Number(node.dataset.resetAt); }).filter(function (value) { return value > 0; });
+        return times.length ? Math.min.apply(null, times) : Infinity;
+      }
+      function applyFilters(announce) {
+        if (!grid) return;
+        var query = search.value.trim().toLocaleLowerCase();
+        var attentionCount = cards.filter(needsAttention).length;
+        document.getElementById("attention-count").textContent = attentionCount;
+        document.getElementById("attention-total").textContent = attentionCount ? " · " + attentionCount + " 个需关注" : "";
+        filterButtons.forEach(function (button) { button.setAttribute("aria-pressed", String(button.dataset.filter === activeFilter)); });
+        var sorted = cards.slice().sort(function (a, b) {
+          var delta = 0;
+          if (sort.value === "quota") {
+            var qa = Number(a.dataset.quota), qb = Number(b.dataset.quota);
+            delta = (qa === 101 ? -1 : qa) - (qb === 101 ? -1 : qb);
+            delta = -delta;
+          } else if (sort.value === "reset") { delta = nextReset(a) - nextReset(b); }
+          else if (sort.value === "expiry") { delta = (Number(a.dataset.expiry) || Infinity) - (Number(b.dataset.expiry) || Infinity); }
+          return (Number.isNaN(delta) ? 0 : delta) || Number(a.dataset.index) - Number(b.dataset.index);
+        });
+        var visible = 0;
+        sorted.forEach(function (card, index) {
+          card.hidden = !(card.dataset.search.toLocaleLowerCase().includes(query) && (activeFilter === "all" || needsAttention(card)));
+          if (!card.hidden) visible++;
+          if (grid.children[index] !== card) grid.insertBefore(card, grid.children[index] || null);
+        });
+        document.getElementById("filter-empty").hidden = visible !== 0;
+        if (announce) document.getElementById("filter-result").textContent = "显示 " + visible + " 个账号，共 " + cards.length + " 个";
+      }
+      filterButtons.forEach(function (button) { button.addEventListener("click", function () { activeFilter = button.dataset.filter; applyFilters(true); saveState(); }); });
+      if (search) search.addEventListener("input", function () { applyFilters(true); saveState(); });
+      if (sort) sort.addEventListener("change", function () { applyFilters(true); saveState(); });
+      var clearButton = document.getElementById("clear-filters");
+      if (clearButton) clearButton.addEventListener("click", function () { activeFilter = "all"; search.value = ""; applyFilters(true); saveState(); search.focus(); });
+      try {
+        var state = JSON.parse(sessionStorage.getItem(stateKey) || "null");
+        if (state && grid) {
+          activeFilter = state.filter === "attention" ? "attention" : "all";
+          search.value = typeof state.query === "string" ? state.query : "";
+          sort.value = ["default", "quota", "reset", "expiry"].includes(state.sort) ? state.sort : "default";
+        }
+        if (state) usageDetails.open = Boolean(state.usageOpen);
+        applyFilters(false);
+        if (state && Number.isFinite(state.scroll)) requestAnimationFrame(function () { window.scrollTo(0, state.scroll); });
+      } catch (_) { applyFilters(false); }
+      usageDetails.addEventListener("toggle", saveState);
+      window.addEventListener("pagehide", saveState);
+      document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible") { updateTimes(); applyFilters(false); } });
+      var tick = 0;
+      refreshTimer = setInterval(function () { updateTimes(); if (++tick % 60 === 0) applyFilters(false); }, 1000);
+      updateTimes();
+    })();
+  </script>
+</body>
+</html>
