@@ -34,10 +34,13 @@ func TestDashboardRendersQuotaAndExpiryWithoutJavaScript(t *testing.T) {
 	html := out.String()
 	// Core account information must be server-rendered even when scripts fail or
 	// are disabled, while secondary usage stays collapsed until requested.
-	for _, want := range []string{"72<small>%</small>", "5小时后重置", "剩余 30 天", account.Subscription.ExpiresLabel, "暂无此额度窗口", `<details class="secondary" id="usage-details">`} {
+	for _, want := range []string{"72<small>%</small>", "5小时后重置", "剩余 30 天", account.Subscription.ExpiresLabel, `<details class="secondary" id="usage-details">`} {
 		if !strings.Contains(html, want) {
 			t.Errorf("server-rendered page missing %q", want)
 		}
+	}
+	if strings.Contains(html, "周额度") || strings.Contains(html, "暂无此额度窗口") {
+		t.Error("page should omit quota windows that are not present")
 	}
 	for _, private := range []string{"alice@example.com", "private-account-key", "<script>alert("} {
 		if strings.Contains(html, private) {

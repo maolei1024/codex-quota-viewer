@@ -70,6 +70,7 @@
     .status.danger { background: var(--danger-bg); }
     .status.muted, .status.unknown { background: var(--soft); color: var(--muted); }
     .quotas { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; margin: 22px 0 18px; }
+    .quota:only-child { grid-column: 1 / -1; }
     .quota + .quota { border-left: 1px solid var(--line); padding-left: 16px; }
     .quota-label { color: var(--muted); font-size: 13px; }
     .quota-value { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin: 3px 0 8px; }
@@ -82,7 +83,6 @@
     .fill.danger { background: var(--danger); }
     .reset-countdown { display: block; font-size: 13px; font-weight: 600; margin-top: 11px; overflow-wrap: anywhere; }
     .reset-date { display: block; color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
-    .quota-missing { margin-top: 8px; font-size: 20px; font-weight: 600; color: var(--muted); }
     .quota-unavailable { font-size: 12px; color: var(--muted); margin-top: 10px; }
     .subscription { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding-top: 15px; border-top: 1px solid var(--line); }
     .subscription-label { color: var(--muted); font-size: 13px; padding-top: 2px; flex: none; }
@@ -202,24 +202,25 @@
             <span class="status {{accountStateClass .}}">{{accountState .}}</span>
           </div>
           <div class="quotas">
+            {{if .Hourly.Present}}
             <div class="quota">
               <p class="quota-label">{{windowLabel .Hourly "5 小时额度"}}</p>
-              {{if .Hourly.Present}}
               <div class="quota-value"><strong class="{{.Hourly.Class}}">{{.Hourly.Remaining}}<small>%</small></strong><span>剩余</span></div>
               <div class="track" aria-hidden="true"><div class="fill {{.Hourly.Class}}" style="width: {{.Hourly.Remaining}}%"></div></div>
               <span class="reset-countdown" data-reset-at="{{timestamp .Hourly.ResetAt}}">{{resetCountdown .Hourly.ResetAt $.GeneratedAt}}</span>
               {{if .Hourly.ResetAt}}<time class="reset-date" data-time="{{timestamp .Hourly.ResetAt}}">{{.Hourly.ResetLabel}}</time>{{end}}
-              {{else}}<p class="quota-missing">未提供</p><p class="quota-unavailable">暂无此额度窗口</p>{{end}}
             </div>
+            {{end}}
+            {{if .Weekly.Present}}
             <div class="quota">
               <p class="quota-label">{{windowLabel .Weekly "周额度"}}</p>
-              {{if .Weekly.Present}}
               <div class="quota-value"><strong class="{{.Weekly.Class}}">{{.Weekly.Remaining}}<small>%</small></strong><span>剩余</span></div>
               <div class="track" aria-hidden="true"><div class="fill {{.Weekly.Class}}" style="width: {{.Weekly.Remaining}}%"></div></div>
               <span class="reset-countdown" data-reset-at="{{timestamp .Weekly.ResetAt}}">{{resetCountdown .Weekly.ResetAt $.GeneratedAt}}</span>
               {{if .Weekly.ResetAt}}<time class="reset-date" data-time="{{timestamp .Weekly.ResetAt}}">{{.Weekly.ResetLabel}}</time>{{end}}
-              {{else}}<p class="quota-missing">未提供</p><p class="quota-unavailable">暂无此额度窗口</p>{{end}}
             </div>
+            {{end}}
+            {{if not (or .Hourly.Present .Weekly.Present)}}<div class="quota"><p class="quota-unavailable">暂无额度数据</p></div>{{end}}
           </div>
           <div class="subscription">
             <span class="subscription-label">套餐有效期</span>
