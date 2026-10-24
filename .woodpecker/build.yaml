@@ -1,3 +1,8 @@
+clone:
+  git:
+    image: docker.nexus.ixuni.win/ops/woodpecker-git:latest
+    pull: true
+
 matrix:
   ARCH:
   - amd64
